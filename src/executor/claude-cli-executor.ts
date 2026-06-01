@@ -77,13 +77,16 @@ export async function executeTask(task: Task): Promise<ExecutionResult> {
   const args = ["-p", "--output-format", "text", ...stack.cliArgs];
 
   return new Promise<ExecutionResult>((resolve) => {
+    // Strip ANTHROPIC_API_KEY from the child env: when it is set (and
+    // invalid / expired) claude CLI rejects with "Invalid API key" instead
+    // of falling back to the user's OAuth Max session in ~/.claude/. On
+    // scorta + Hetzner we rely on OAuth Max, so the right move is to
+    // simply not propagate the env var at all.
+    const childEnv = { ...process.env };
+    delete childEnv["ANTHROPIC_API_KEY"];
     const child = spawn(env.CLAUDE_CLI_PATH, args, {
       cwd: worktree.cwd,
-      env: {
-        ...process.env,
-        // Pass the chosen model via env too, belt-and-suspenders.
-        ANTHROPIC_MODEL: task.stack.model ?? env.PLYNE_CLAUDE_MODEL
-      },
+      env: childEnv,
       stdio: ["pipe", "pipe", "pipe"]
     });
 

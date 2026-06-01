@@ -97,11 +97,17 @@ export function loadStack(opts: LoadStackOptions): LoadedStack {
   const model = opts.config.model ?? opts.model;
   cliArgs.push("--model", model);
 
-  // Extended thinking — pass-through to claude CLI's reasoning mode flag.
-  // The exact flag name changed across CLI versions; we use the 2.x form
-  // which is documented in /usr/bin/claude --help on the VPS.
+  // Permission mode — always `acceptEdits` for headless runs, otherwise
+  // claude exits early asking the (non-existent) user to grant Write access.
+  // This is independent of extended thinking, which we wire via --effort
+  // below.
+  cliArgs.push("--permission-mode", "acceptEdits");
+
+  // Extended thinking — claude CLI 2.x exposes this as `--effort high`
+  // (choices: low, medium, high, xhigh, max). For M/L/XL we ask for the
+  // deeper reasoning budget; for XS/S we leave the default.
   if (opts.extendedThinking) {
-    cliArgs.push("--permission-mode", "acceptEdits");
+    cliArgs.push("--effort", "high");
   }
 
   // MCP servers — write a temp config file claude can consume.
