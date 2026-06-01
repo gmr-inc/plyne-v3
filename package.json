@@ -1,0 +1,28 @@
+{
+  "name": "@gmr-inc/plyne-v3",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Plyne v3 — Claude Code orchestrator that abuses the Anthropic stack (MCP, Skills, Sub-agents, Hooks, Memory, Computer Use)",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/mcp/server.ts",
+    "mcp:stdio": "tsx src/mcp/server.ts",
+    "mcp:http": "PLYNE_MCP_TRANSPORT=http tsx src/mcp/server.ts",
+    "mcp:smoke": "tsx scripts/smoke-test.ts",
+    "test": "node --test --import tsx ./src/**/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
