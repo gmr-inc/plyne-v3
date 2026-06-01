@@ -1,0 +1,30 @@
+{
+  "name": "plyne-v3",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Plyne v3 — Claude Code orchestrator that ABUSES the Anthropic stack (MCP, Skills, sub-agents, memory, hooks).",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "node ./node_modules/typescript/bin/tsc -p tsconfig.json",
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "dev": "node ./node_modules/tsx/dist/cli.mjs src/index.ts",
+    "start": "node dist/index.js",
+    "smoke": "node ./node_modules/tsx/dist/cli.mjs src/smoke/v3-test-hello.ts"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "pino": "^10.3.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

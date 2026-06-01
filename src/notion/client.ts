@@ -1,0 +1,184 @@
+/**
+ * Minimal Notion gateway for Plyne v3.
+ *
+ * v2 had a 2000-line gateway covering 11 lifecycle phases, spec ingest
+ * rejection paths, brain enrichment, healing comments. v3 needs four ops:
+ *   1. List ready tasks (filtered by status + V3 prefix)
+ *   2. Read one task (full properties + comments)
+ *   3. Update status (with optional comment + pr_url)
+ *   4. Append a comment (free-form, for progress trace)
+ */
+import { Client } from "@notionhq/client";
+import { z } from "zod";
+import { loadEnv } from "../config/env.js";
+import { logger } from "../config/logger.js";
+
+const env = loadEnv();
+const notion = new Client({ auth: env.NOTION_TOKEN });
+
+export const TaskStatus = z.enum([
+  "backlog",
+  "draft",
+  "ready",
+  "claiming",
+  "executing",
+  "pr-open",
+  "done",
+  "needs-operator",
+  "abandoned",
+  "cancelled"
+]);
+export type TaskStatus = z.infer<typeof TaskStatus>;
+
+/**
+ * Per-task Anthropic-stack config — read from task properties.
+ * Architecture §"Data model": mcp_servers, skills, computer_use, model.
+ */
+export interface TaskStackConfig {
+  mcpServers: string[];
+  skills: string[];
+  computerUse: boolean;
+  model?: string | undefined;
+}
+
+export interface Task {
+  id: string; // Notion page id
+  externalId: string; // e.g. "V3-TEST-HELLO-001"
+  title: string;
+  status: TaskStatus;
+  product: string;
+  repo: string;
+  effort: "XS" | "S" | "M" | "L" | "XL" | null;
+  instructions: string;
+  acceptanceCriteria: string;
+  stack: TaskStackConfig;
+  prUrl: string | null;
+}
+
+function getTitle(props: Record<string, unknown>): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const t = (props as any)?.["Name"] ?? (props as any)?.["Title"];
+  if (!t?.title?.length) return "";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return t.title.map((s: any) => s?.plain_text ?? "").join("");
+}
+
+function getRichText(props: Record<string, unknown>, key: string): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const p = (props as any)?.[key];
+  if (!p?.rich_text?.length) return "";
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return p.rich_text.map((s: any) => s?.plain_text ?? "").join("");
+}
+
+function getSelect(props: Record<string, unknown>, key: string): string | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (props as any)?.[key]?.select?.name ?? null;
+}
+
+function getStatus(props: Record<string, unknown>, key = "Status"): string | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (props as any)?.[key]?.status?.name ?? null;
+}
+
+function getMultiSelect(props: Record<string, unknown>, key: string): string[] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const ms = (props as any)?.[key]?.multi_select;
+  if (!Array.isArray(ms)) return [];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return ms.map((o: any) => o?.name).filter(Boolean);
+}
+
+function getCheckbox(props: Record<string, unknown>, key: string): boolean {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (props as any)?.[key]?.checkbox === true;
+}
+
+function getUrl(props: Record<string, unknown>, key: string): string | null {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (props as any)?.[key]?.url ?? null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapPage(page: any): Task | null {
+  const props = page?.properties ?? {};
+  const externalId = getTitle(props);
+  const statusRaw = getStatus(props) ?? getSelect(props, "Status");
+  const parsedStatus = TaskStatus.safeParse(statusRaw);
+  if (!parsedStatus.success) return null;
+  const effortRaw = getSelect(props, "Effort");
+  const effort =
+    effortRaw === "XS" || effortRaw === "S" || effortRaw === "M" || effortRaw === "L" || effortRaw === "XL"
+      ? effortRaw
+      : null;
+  return {
+    id: page.id,
+    externalId,
+    title: getRichText(props, "Description") || externalId,
+    status: parsedStatus.data,
+    product: getSelect(props, "Product") ?? "",
+    repo: getSelect(props, "Repo") ?? "",
+    effort,
+    instructions: getRichText(props, "Instructions"),
+    acceptanceCriteria: getRichText(props, "Acceptance Criteria"),
+    stack: {
+      mcpServers: getMultiSelect(props, "MCP Servers"),
+      skills: getMultiSelect(props, "Skills"),
+      computerUse: getCheckbox(props, "Computer Use"),
+      model: getSelect(props, "Model") ?? undefined
+    },
+    prUrl: getUrl(props, "PR URL")
+  };
+}
+
+/**
+ * List tasks in `ready` status filtered to the V3 prefix.
+ * Returns at most `limit` rows ordered by oldest-first (FIFO).
+ */
+export async function listReadyTasks(prefix: string, limit = 5): Promise<Task[]> {
+  const res = await notion.databases.query({
+    database_id: env.NOTION_TASKS_DB_ID,
+    page_size: 25,
+    sorts: [{ timestamp: "created_time", direction: "ascending" }]
+  });
+  const tasks: Task[] = [];
+  for (const page of res.results) {
+    const t = mapPage(page);
+    if (!t) continue;
+    if (t.status !== "ready") continue;
+    if (prefix && !t.externalId.startsWith(prefix)) continue;
+    tasks.push(t);
+    if (tasks.length >= limit) break;
+  }
+  return tasks;
+}
+
+export async function getTask(pageId: string): Promise<Task | null> {
+  try {
+    const page = await notion.pages.retrieve({ page_id: pageId });
+    return mapPage(page);
+  } catch (err) {
+    logger.warn({ pageId, err }, "notion.getTask failed");
+    return null;
+  }
+}
+
+export async function setStatus(pageId: string, status: TaskStatus, prUrl?: string): Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const properties: Record<string, any> = {
+    Status: { status: { name: status } }
+  };
+  if (prUrl) properties["PR URL"] = { url: prUrl };
+  await notion.pages.update({ page_id: pageId, properties });
+}
+
+export async function addComment(pageId: string, text: string): Promise<void> {
+  // Notion comment body has a 2000-char limit per rich-text segment; chunk if needed.
+  const MAX = 1900;
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += MAX) chunks.push(text.slice(i, i + MAX));
+  await notion.comments.create({
+    parent: { page_id: pageId },
+    rich_text: chunks.map((c) => ({ type: "text" as const, text: { content: c } }))
+  });
+}
