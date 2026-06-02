@@ -12,7 +12,8 @@
     "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
     "dev": "node ./node_modules/tsx/dist/cli.mjs src/index.ts",
     "start": "node dist/index.js",
-    "smoke": "node ./node_modules/tsx/dist/cli.mjs src/smoke/v3-test-hello.ts"
+    "smoke": "node ./node_modules/tsx/dist/cli.mjs src/smoke/v3-test-hello.ts",
+    "test": "npm run build && NOTION_TOKEN=test NOTION_TASKS_DB_ID=test node --test 'dist/**/__tests__/*.test.js'"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

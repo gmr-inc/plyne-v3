@@ -45,7 +45,40 @@ const EnvSchema = z.object({
   // Boot mode: "daemon" (default — polling loop) or "smoke" (one-shot).
   PLYNE_MODE: z.enum(["daemon", "smoke"]).default("daemon"),
 
-  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info")
+  LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+
+  // ── Monitoring ingestion (Sentry / BetterStack / Braintrust / Statuspage)
+  //
+  // All keys are optional — when missing the corresponding poller no-ops
+  // gracefully (logged at info on boot). The daemon must run even when
+  // monitoring isn't fully wired (greenfield VPS, dev environment).
+  //
+  // Set `PLYNE_INGESTION_ENABLED=false` to disable the whole subsystem
+  // even when credentials are present (useful during audit/debug windows
+  // per memory feedback_plyne_on_off_audit_policy.md).
+  PLYNE_INGESTION_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true" || v === "1"),
+
+  SENTRY_AUTH_TOKEN: z.string().optional(),
+  SENTRY_ORG: z.string().optional(),
+  SENTRY_ORG_SLUG: z.string().optional(),
+
+  BETTERSTACK_API_TOKEN: z.string().optional(),
+  BETTERSTACK_UPTIME_TOKEN: z.string().optional(),
+  BETTERSTACK_QUERY_USERNAME: z.string().optional(),
+  BETTERSTACK_QUERY_PASSWORD: z.string().optional(),
+  BETTERSTACK_QUERY_ENDPOINT: z.string().optional(),
+
+  BRAINTRUST_API_KEY: z.string().optional(),
+
+  // Poll cadences — exposed so on-call can tune without a rebuild.
+  // Defaults match the spec (Sentry 10m, BS 5m, Braintrust 30m, Statuspage 2m).
+  INGEST_SENTRY_INTERVAL_MS: z.coerce.number().default(10 * 60 * 1000),
+  INGEST_BETTERSTACK_INTERVAL_MS: z.coerce.number().default(5 * 60 * 1000),
+  INGEST_BRAINTRUST_INTERVAL_MS: z.coerce.number().default(30 * 60 * 1000),
+  INGEST_STATUSPAGE_INTERVAL_MS: z.coerce.number().default(2 * 60 * 1000)
 });
 
 export type Env = z.infer<typeof EnvSchema>;
