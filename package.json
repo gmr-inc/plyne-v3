@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Plyne v3 — Claude Code orchestrator that ABUSES the Anthropic stack (MCP, Skills, sub-agents, memory, hooks).",
+  "description": "Plyne v3 \u2014 Claude Code orchestrator that ABUSES the Anthropic stack (MCP, Skills, sub-agents, memory, hooks).",
   "engines": {
     "node": ">=22.0.0"
   },
@@ -18,6 +18,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@notionhq/client": "^2.2.15",
+    "@supabase/supabase-js": "^2.106.2",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "pino": "^10.3.1",

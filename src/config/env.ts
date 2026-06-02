@@ -81,6 +81,15 @@ const EnvSchema = z.object({
 
   BRAINTRUST_API_KEY: z.string().optional(),
 
+  // ── Notifications writer (Supabase plyne-app data DB)
+  //
+  // The v3 daemon writes "human attention required" events into the
+  // public.notifications table consumed by the plyne-app UI bell. Both keys
+  // are optional so v3 can boot in environments without the dashboard wired
+  // (greenfield VPS, dev/CI). When missing, `notify()` no-ops with a debug log.
+  PLYNE_APP_SUPABASE_URL: z.string().optional(),
+  PLYNE_APP_SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
+
   // Poll cadences — exposed so on-call can tune without a rebuild.
   // Defaults match the spec (Sentry 10m, BS 5m, Braintrust 30m, Statuspage 2m).
   INGEST_SENTRY_INTERVAL_MS: z.coerce.number().default(10 * 60 * 1000),
