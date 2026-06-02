@@ -15,6 +15,7 @@
     "smoke": "node ./node_modules/tsx/dist/cli.mjs src/smoke/v3-test-hello.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@notionhq/client": "^2.2.15",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
