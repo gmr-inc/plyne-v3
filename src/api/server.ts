@@ -20,7 +20,10 @@ export function startApi(): void {
     res.json({ ok: true, service: "plyne-v3", model: env.PLYNE_CLAUDE_MODEL });
   });
 
-  app.all("/mcp", handleMcpRequest);
+  // MCP endpoint — handler is async; wrap in next() to surface errors.
+  app.all("/mcp", (req, res, next) => {
+    handleMcpRequest(req, res).catch(next);
+  });
 
   app.listen(env.API_PORT, () => {
     logger.info({ port: env.API_PORT }, "api: listening");
