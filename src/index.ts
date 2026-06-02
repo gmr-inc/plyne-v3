@@ -2,22 +2,54 @@
  * Plyne v3 entry point.
  *
  * Boot order:
- *   1. Load env (fails fast if mandatory keys missing).
- *   2. Verify NOTION_TOKEN is actually valid via live `users.me` ping.
- *   3. Assert the local repos base path exists (post-VPS-migration guard).
- *   4. Start HTTP API (health + MCP).
- *   5. Start the runner daemon loop.
+ *   1. Hydrate process.env: dotenv (local .env file) then Vercel API pull.
+ *      This must run BEFORE any module that snapshots env at import time
+ *      (logger, env.ts), so we use dynamic imports below.
+ *   2. Load + Zod-validate env.
+ *   3. Live-verify NOTION_TOKEN + comprehensive boot validation
+ *      (GH/Anthropic/Telegram/Supabase tokens + WORKTREE_BASE).
+ *   4. Assert the local repos base path exists (post-VPS-migration guard).
+ *   5. Start HTTP API (health + MCP).
+ *   6. Start the runner daemon loop.
+ *
+ * See:
+ *   - src/config/vercel-env-pull.ts (Task A)
+ *   - src/config/boot-validation.ts (Task B)
+ *   - RESTART.md                    (Task C)
  */
-import { loadEnv } from "./config/env.js";
-import { logger } from "./config/logger.js";
-import { startApi } from "./api/server.js";
-import { startRunner, stopRunner } from "./orchestrator/runner.js";
-import { startIngestion, stopIngestion } from "./ingestion/index.js";
-import { verifyNotionTokenLive } from "./notion/client.js";
-import { assertLocalReposBase } from "./executor/worktree.js";
 
 async function main(): Promise<void> {
+  // ─── Step 1: hydrate process.env ───────────────────────────────────
+  // dotenv must run FIRST so VERCEL_TOKEN is available. We call .config()
+  // explicitly rather than rely on the side-effect import inside env.ts,
+  // because we need it before any other module loads.
+  const dotenv = await import("dotenv");
+  dotenv.config();
+
+  const { pullVercelEnv } = await import("./config/vercel-env-pull.js");
+  const pullResult = await pullVercelEnv();
+
+  // ─── Step 2: now safe to load env (Zod) + logger ───────────────────
+  const { loadEnv } = await import("./config/env.js");
+  const { logger } = await import("./config/logger.js");
   const env = loadEnv();
+
+  if (pullResult.ran) {
+    logger.info(
+      {
+        fromVercel: pullResult.fromVercel,
+        preservedLocal: pullResult.preservedLocal,
+        emptyFromVercel: pullResult.emptyFromVercel
+      },
+      "vercel-env-pull: applied"
+    );
+  } else if (pullResult.error) {
+    // Non-fatal — daemon proceeds with whatever .env contained.
+    logger.warn({ error: pullResult.error }, "vercel-env-pull: skipped");
+  } else {
+    logger.debug("vercel-env-pull: gated off (PLYNE_V3_PULL_VERCEL_ENV!=true)");
+  }
+
   logger.info(
     {
       mode: env.PLYNE_MODE,
@@ -28,22 +60,29 @@ async function main(): Promise<void> {
     "plyne-v3 boot"
   );
 
-  // Hardening checks (see PR fix/v3-crash-loop-hardening): bail out NOW if
-  // the Notion token is invalid or the VPS layout is wrong, instead of
-  // burning pm2 restart budget on un-actionable 401 / EACCES loops.
+  // ─── Step 3: live verification (fail-fast on bad credentials) ──────
+  const { verifyNotionTokenLive } = await import("./notion/client.js");
+  const { runBootValidation } = await import("./config/boot-validation.js");
   await verifyNotionTokenLive();
+  await runBootValidation();
+
+  // ─── Step 4: VPS layout guard ──────────────────────────────────────
+  const { assertLocalReposBase } = await import("./executor/worktree.js");
   assertLocalReposBase();
   logger.info("plyne-v3 hardening checks passed (notion token live, repos base accessible)");
 
+  // ─── Step 5: HTTP API + MCP ────────────────────────────────────────
+  const { startApi } = await import("./api/server.js");
   startApi();
 
   if (env.PLYNE_MODE === "smoke") {
-    // One-shot mode for V3-TEST smoke runs. The smoke script imports the
-    // runner directly; here we just keep the API alive long enough for it
-    // to be probed if needed.
     logger.info("plyne-v3 in smoke mode — runner loop NOT started");
     return;
   }
+
+  // ─── Step 6: runner + ingestion ────────────────────────────────────
+  const { startRunner, stopRunner } = await import("./orchestrator/runner.js");
+  const { startIngestion, stopIngestion } = await import("./ingestion/index.js");
 
   startRunner();
 
