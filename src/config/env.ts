@@ -37,6 +37,14 @@ const EnvSchema = z.object({
   // HTTP API port (health + MCP endpoint).
   API_PORT: z.coerce.number().default(7733),
 
+  // Shared bearer secret protecting the SSE `/activity/stream` endpoint.
+  // plyne-app uses this same value to authenticate the upstream connection
+  // from its `/api/v1/activity` proxy route. Optional in env contract so the
+  // daemon can boot without the dashboard wired; the SSE handler returns
+  // 503 when missing, which makes the misconfiguration obvious instead of
+  // silently allowing unauthenticated streaming.
+  PLYNE_DAEMON_API_TOKEN: z.string().optional(),
+
   // Filter for V3 test-flight phase: only pick tasks tagged with this Repo
   // prefix or matching this external_id prefix. Architecture §"VPS deployment"
   // calls this out so v3 can run parallel to v2 without stealing v2 work.

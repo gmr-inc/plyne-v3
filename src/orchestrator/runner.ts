@@ -20,8 +20,38 @@ import {
 } from "../notion/client.js";
 import { executeTask } from "../executor/claude-cli-executor.js";
 import { pushAndOpenPR, type PushPrResult } from "../executor/git-push-pr.js";
+import { getEventBus, type ActivityEventType } from "../lib/event-bus.js";
 
 const env = loadEnv();
+const bus = getEventBus();
+
+/**
+ * Centralized SSE event emitter — keeps the shape consistent (task id,
+ * truncated title, repo) across every lifecycle hook and prevents drift
+ * between event types.
+ *
+ * Failure handling: emitActivity is in-process and synchronous; the only
+ * realistic crash path is a listener throwing. Never let that take down the
+ * runner — log warn and continue. A dark dashboard is strictly less bad
+ * than a stopped daemon mid-task.
+ */
+function emitActivity(
+  task: Task,
+  event_type: ActivityEventType,
+  details: Record<string, unknown> = {}
+): void {
+  try {
+    bus.emitActivity({
+      event_type,
+      task_id: task.id,
+      task_name: (task.title ?? "").slice(0, 200) || "(untitled)",
+      task_repo: task.repo || "(unknown)",
+      details
+    });
+  } catch (err) {
+    logger.warn({ err, event_type, taskId: task.externalId }, "runner: emitActivity failed");
+  }
+}
 
 const inFlight = new Set<string>();
 
@@ -64,8 +94,10 @@ async function processOne(task: Task): Promise<void> {
   inFlight.add(task.id);
   try {
     logger.info({ taskId: task.externalId }, "runner: claim");
+    emitActivity(task, "task.picked", { external_id: task.externalId });
     await setStatus(task.id, "claiming");
     await setStatus(task.id, "executing");
+    emitActivity(task, "task.executor.started", { external_id: task.externalId });
 
     const result = await executeTask(task);
     const markers = inspectMarkers(result.worktreeCwd);
@@ -100,10 +132,31 @@ async function processOne(task: Task): Promise<void> {
     // the old "done from marker alone" path — a task with no PR is not done).
     if (pr) {
       await setStatus(task.id, "pr-open", pr.prUrl);
+      emitActivity(task, "task.pr.opened", {
+        external_id: task.externalId,
+        pr_url: pr.prUrl,
+        branch: pr.branch,
+        commit_sha: pr.commitSha
+      });
+      // task.done as a separate event so the UI can render a completion
+      // bullet distinct from the PR-opened one (operator may want to see
+      // both — "PR opened" + "task closed by Plyne").
+      emitActivity(task, "task.done", { external_id: task.externalId, pr_url: pr.prUrl });
     } else if (markers.status === "blocked") {
       await setStatus(task.id, "needs-operator");
+      emitActivity(task, "task.escalated", {
+        external_id: task.externalId,
+        reason: "self_blocked",
+        note: markers.note
+      });
     } else {
       await setStatus(task.id, "needs-operator");
+      emitActivity(task, "task.failed", {
+        external_id: task.externalId,
+        pr_error: prError,
+        exit_code: result.exitCode,
+        marker: markers.status
+      });
     }
 
     const commentLines = [
@@ -127,6 +180,11 @@ async function processOne(task: Task): Promise<void> {
     if (pr) result.worktreeDestroy();
   } catch (err) {
     logger.error({ taskId: task.externalId, err }, "runner: processOne failed");
+    emitActivity(task, "task.failed", {
+      external_id: task.externalId,
+      reason: "runner_exception",
+      error: String(err).slice(0, 300)
+    });
     try {
       await setStatus(task.id, "needs-operator");
       await addComment(task.id, `Plyne v3 crashed processing this task:\n\n\`\`\`\n${String(err).slice(0, 1500)}\n\`\`\``);
