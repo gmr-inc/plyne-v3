@@ -3,14 +3,18 @@
  *
  * Boot order:
  *   1. Load env (fails fast if mandatory keys missing).
- *   2. Start HTTP API (health + MCP).
- *   3. Start the runner daemon loop.
+ *   2. Verify NOTION_TOKEN is actually valid via live `users.me` ping.
+ *   3. Assert the local repos base path exists (post-VPS-migration guard).
+ *   4. Start HTTP API (health + MCP).
+ *   5. Start the runner daemon loop.
  */
 import { loadEnv } from "./config/env.js";
 import { logger } from "./config/logger.js";
 import { startApi } from "./api/server.js";
 import { startRunner, stopRunner } from "./orchestrator/runner.js";
 import { startIngestion, stopIngestion } from "./ingestion/index.js";
+import { verifyNotionTokenLive } from "./notion/client.js";
+import { assertLocalReposBase } from "./executor/worktree.js";
 
 async function main(): Promise<void> {
   const env = loadEnv();
@@ -23,6 +27,13 @@ async function main(): Promise<void> {
     },
     "plyne-v3 boot"
   );
+
+  // Hardening checks (see PR fix/v3-crash-loop-hardening): bail out NOW if
+  // the Notion token is invalid or the VPS layout is wrong, instead of
+  // burning pm2 restart budget on un-actionable 401 / EACCES loops.
+  await verifyNotionTokenLive();
+  assertLocalReposBase();
+  logger.info("plyne-v3 hardening checks passed (notion token live, repos base accessible)");
 
   startApi();
 

@@ -16,6 +16,41 @@ import { logger } from "../config/logger.js";
 const env = loadEnv();
 const notion = new Client({ auth: env.NOTION_TOKEN });
 
+/**
+ * Live boot-time check: ping `users.me` to confirm the NOTION_TOKEN is not
+ * just non-empty (already enforced by Zod) but actually valid.
+ *
+ * Why: on 2026-06-02 the v3 daemon piled up 1923 pm2 restarts in 2h because
+ * the env was syntactically valid but the token had been rotated. The
+ * `@notionhq/client` library only logs `request fail` warnings on 401; the
+ * runner caught the cycle error and kept polling, burning Notion API quota
+ * and log volume. Failing fast at boot makes pm2's restart-count surface the
+ * problem within seconds, instead of letting it bleed.
+ */
+export async function verifyNotionTokenLive(): Promise<void> {
+  try {
+    await notion.users.me({});
+  } catch (err) {
+    const e = err as { code?: string; status?: number; message?: string };
+    // eslint-disable-next-line no-console
+    console.error(
+      `FATAL: NOTION_TOKEN failed live verification (code=${e.code ?? "?"} ` +
+        `status=${e.status ?? "?"}): ${e.message ?? String(err)}`
+    );
+    process.exit(1);
+  }
+}
+
+/**
+ * True when the error looks like a Notion auth failure (token revoked, scope
+ * dropped, etc). Used by the runner to break out of the polling loop instead
+ * of spamming 401s every 15s forever.
+ */
+export function isNotionAuthError(err: unknown): boolean {
+  const e = err as { code?: string; status?: number };
+  return e?.code === "unauthorized" || e?.status === 401;
+}
+
 export const TaskStatus = z.enum([
   "backlog",
   "draft",
