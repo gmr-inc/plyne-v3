@@ -1,30 +1,23 @@
 /**
- * Plyne v3 runner — single cycle: pollReadyTasks → claim → execute → update.
+ * Plyne v3 runner — single cycle: pollReadyTasks → claim → execute →
+ * commit + push + PR → update Notion.
  *
- * v2's runner.ts was 4641 LoC with 30+ orchestrator subsystems
- * (merge-loop, sprint-planner, sequencer, cap-enforcer, blast-radius,
- * postmortem, trust-tier, …). v3 deletes all of that.
- *
- * Why so small? Because the architecture pivot is: "Plyne does NOT play
- * autonomous CTO. Plyne hands a well-specced task to Claude Code (which
- * has MCP + Skills + memory of its own) and watches the result." The
- * intelligence lives in Claude + the task spec, not in Plyne.
+ * v2's runner.ts was 4641 LoC with 30+ orchestrator subsystems. v3 deletes
+ * all of that. v3.1 adds back the one thing v3 stripped too aggressively:
+ * the post-execution git workflow. Without it, Claude wrote orphan files
+ * in a non-git temp dir and tasks were marked done with zero output.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadEnv } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { listReadyTasks, setStatus, addComment, type Task } from "../notion/client.js";
-import { executeTask, type ExecutionResult } from "../executor/claude-cli-executor.js";
+import { executeTask } from "../executor/claude-cli-executor.js";
+import { pushAndOpenPR, type PushPrResult } from "../executor/git-push-pr.js";
 
 const env = loadEnv();
 
 const inFlight = new Set<string>();
-
-interface ExecutionResultExt extends ExecutionResult {
-  worktreeCwd?: string;
-  worktreeDestroy?: () => void;
-}
 
 /**
  * Read the done/blocked marker file Claude was instructed to write.
@@ -54,9 +47,44 @@ async function processOne(task: Task): Promise<void> {
     await setStatus(task.id, "claiming");
     await setStatus(task.id, "executing");
 
-    const result = (await executeTask(task)) as ExecutionResultExt;
-    const cwd = result.worktreeCwd;
-    const markers = cwd ? inspectMarkers(cwd) : { status: "unknown" as const, note: "" };
+    const result = await executeTask(task);
+    const markers = inspectMarkers(result.worktreeCwd);
+
+    // Before reporting, also strip the marker files so they don't get
+    // committed into the PR diff. They're Plyne signaling, not project code.
+    for (const marker of ["PLYNE_V3_DONE.txt", "PLYNE_V3_BLOCKED.txt"]) {
+      const p = path.join(result.worktreeCwd, marker);
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    let pr: PushPrResult | null = null;
+    let prError: string | null = null;
+
+    // Open a PR if (a) we have a real git worktree, (b) Claude did not
+    // explicitly self-block. Done-marker is preferred but optional: if
+    // Claude forgot the marker but produced a diff, we still want the PR.
+    if (result.branch && markers.status !== "blocked") {
+      try {
+        pr = await pushAndOpenPR(task, result.worktreeCwd, result.branch, result.childEnv);
+      } catch (err) {
+        prError = String(err).slice(0, 400);
+        logger.error({ taskId: task.externalId, err }, "runner: pushAndOpenPR threw");
+      }
+    }
+
+    // Update Notion: pr-open wins, else needs-operator (we deliberately drop
+    // the old "done from marker alone" path — a task with no PR is not done).
+    if (pr) {
+      await setStatus(task.id, "pr-open", pr.prUrl);
+    } else if (markers.status === "blocked") {
+      await setStatus(task.id, "needs-operator");
+    } else {
+      await setStatus(task.id, "needs-operator");
+    }
 
     const commentLines = [
       `**Plyne v3 execution complete**`,
@@ -65,24 +93,18 @@ async function processOne(task: Task): Promise<void> {
       `- duration: \`${result.durationMs}ms\``,
       `- stack: \`${result.stackSummary}\``,
       `- marker: \`${markers.status}\``,
+      `- branch: \`${result.branch ?? "(scratch dir — no git)"}\``,
+      pr ? `- PR: ${pr.prUrl} (\`${pr.commitSha.slice(0, 7)}\`)` : `- PR: _none_`,
       markers.note ? `- note: ${markers.note}` : "",
+      prError ? `- pr error: ${prError}` : "",
       ``,
       result.stderr ? `**stderr (last 500 chars):**\n\n\`\`\`\n${result.stderr.slice(-500)}\n\`\`\`` : ""
     ].filter(Boolean);
     await addComment(task.id, commentLines.join("\n"));
 
-    if (result.exitCode === 0 && markers.status === "done") {
-      await setStatus(task.id, "done");
-    } else if (markers.status === "blocked") {
-      await setStatus(task.id, "needs-operator");
-    } else if (result.exitCode === 0) {
-      // Claude exited clean but didn't write a marker — operator decides.
-      await setStatus(task.id, "needs-operator");
-    } else {
-      await setStatus(task.id, "needs-operator");
-    }
-
-    if (result.worktreeDestroy) result.worktreeDestroy();
+    // Cleanup worktree only on success (PR opened). On failure, leave it so
+    // operator can poke at it.
+    if (pr) result.worktreeDestroy();
   } catch (err) {
     logger.error({ taskId: task.externalId, err }, "runner: processOne failed");
     try {
