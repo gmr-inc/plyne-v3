@@ -11,13 +11,33 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadEnv } from "../config/env.js";
 import { logger } from "../config/logger.js";
-import { listReadyTasks, setStatus, addComment, type Task } from "../notion/client.js";
+import {
+  listReadyTasks,
+  setStatus,
+  addComment,
+  isNotionAuthError,
+  type Task
+} from "../notion/client.js";
 import { executeTask } from "../executor/claude-cli-executor.js";
 import { pushAndOpenPR, type PushPrResult } from "../executor/git-push-pr.js";
 
 const env = loadEnv();
 
 const inFlight = new Set<string>();
+
+/**
+ * Circuit breaker: if the polling cycle gets a Notion 401 N times in a row
+ * (token rotated mid-run, workspace scope dropped, etc.), stop the runner
+ * loop entirely. Hardcoded threshold — we'd rather hold than spam 401s every
+ * 15s forever. Operator sees the runner stop in logs + pm2 surfacing healthy
+ * process (HTTP API still up for /health), then can rotate the token and
+ * `pm2 restart plyne-v3`.
+ *
+ * Tested against the 2026-06-02 incident pattern: a revoked token used to
+ * burn ~1900 cycles in 2h. With this gate, it now burns 5.
+ */
+const MAX_CONSECUTIVE_AUTH_ERRORS = 5;
+let consecutiveAuthErrors = 0;
 
 /**
  * Read the done/blocked marker file Claude was instructed to write.
@@ -121,7 +141,36 @@ async function processOne(task: Task): Promise<void> {
 async function cycle(): Promise<void> {
   if (inFlight.size >= env.MAX_CONCURRENT_TASKS) return;
   const slots = env.MAX_CONCURRENT_TASKS - inFlight.size;
-  const tasks = await listReadyTasks(env.PLYNE_V3_TASK_PREFIX, slots);
+  let tasks: Task[];
+  try {
+    tasks = await listReadyTasks(env.PLYNE_V3_TASK_PREFIX, slots);
+  } catch (err) {
+    if (isNotionAuthError(err)) {
+      consecutiveAuthErrors += 1;
+      logger.error(
+        { consecutiveAuthErrors, threshold: MAX_CONSECUTIVE_AUTH_ERRORS },
+        "runner: Notion auth error during poll — counting toward circuit breaker"
+      );
+      if (consecutiveAuthErrors >= MAX_CONSECUTIVE_AUTH_ERRORS) {
+        logger.fatal(
+          { consecutiveAuthErrors },
+          "runner: circuit breaker tripped — stopping runner. Rotate NOTION_TOKEN and `pm2 restart plyne-v3`."
+        );
+        stopRunner();
+      }
+      return;
+    }
+    // Non-auth errors (timeouts, socket hang up) — log and try again next tick.
+    throw err;
+  }
+  // Successful poll → reset the auth-error counter.
+  if (consecutiveAuthErrors > 0) {
+    logger.info(
+      { previousCount: consecutiveAuthErrors },
+      "runner: Notion auth recovered — resetting circuit breaker"
+    );
+    consecutiveAuthErrors = 0;
+  }
   if (tasks.length === 0) return;
   logger.info({ count: tasks.length, prefix: env.PLYNE_V3_TASK_PREFIX }, "runner: picked tasks");
   // Fire-and-forget per task; each manages its own status updates.

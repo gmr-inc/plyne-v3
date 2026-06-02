@@ -23,7 +23,39 @@ import { logger } from "../config/logger.js";
 const env = loadEnv();
 
 // Local clones live here on the VPS. Each subdir name == Notion `Repo` value.
+// Was `/root/Desktop/Projects` pre-2026-06-01 when Plyne ran as root on the
+// Hetzner VPS. Migration to non-root `plyne` user is now permanent; if a
+// future infra change moves this base, update + run `assertLocalReposBase()`
+// at boot to catch the drift immediately rather than per-task at runtime.
 const LOCAL_REPOS_BASE = "/home/plyne/Desktop/Projects";
+
+/**
+ * Boot-time guard: if LOCAL_REPOS_BASE doesn't exist (or isn't a directory),
+ * fail-fast instead of letting every task hit `Failed to create worktree:
+ * cannot change to '<base>/<repo>': Permission denied` at runtime. This is
+ * what bit us during the root→plyne user migration: code had been updated,
+ * but the bind / chmod hadn't propagated, and tasks died one by one with
+ * cryptic errors.
+ */
+export function assertLocalReposBase(): void {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(LOCAL_REPOS_BASE);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `FATAL: LOCAL_REPOS_BASE not accessible: ${LOCAL_REPOS_BASE} ` +
+        `(${(err as Error).message}). The VPS layout expects per-repo clones ` +
+        `under this directory — see src/executor/worktree.ts.`
+    );
+    process.exit(1);
+  }
+  if (!stat.isDirectory()) {
+    // eslint-disable-next-line no-console
+    console.error(`FATAL: LOCAL_REPOS_BASE exists but is not a directory: ${LOCAL_REPOS_BASE}`);
+    process.exit(1);
+  }
+}
 
 export interface Worktree {
   taskId: string;
