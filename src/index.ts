@@ -10,6 +10,7 @@ import { loadEnv } from "./config/env.js";
 import { logger } from "./config/logger.js";
 import { startApi } from "./api/server.js";
 import { startRunner, stopRunner } from "./orchestrator/runner.js";
+import { startIngestion, stopIngestion } from "./ingestion/index.js";
 
 async function main(): Promise<void> {
   const env = loadEnv();
@@ -35,9 +36,16 @@ async function main(): Promise<void> {
 
   startRunner();
 
+  if (env.PLYNE_INGESTION_ENABLED) {
+    startIngestion();
+  } else {
+    logger.info("ingestion: disabled via PLYNE_INGESTION_ENABLED=false");
+  }
+
   const shutdown = (signal: string) => {
     logger.info({ signal }, "plyne-v3 shutting down");
     stopRunner();
+    stopIngestion();
     setTimeout(() => process.exit(0), 1500);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
