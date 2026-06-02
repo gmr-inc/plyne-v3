@@ -21,6 +21,7 @@ import {
 import { executeTask } from "../executor/claude-cli-executor.js";
 import { pushAndOpenPR, type PushPrResult } from "../executor/git-push-pr.js";
 import { getEventBus, type ActivityEventType } from "../lib/event-bus.js";
+import { notify } from "../lib/notifications-writer.js";
 
 const env = loadEnv();
 const bus = getEventBus();
@@ -132,6 +133,7 @@ async function processOne(task: Task): Promise<void> {
     // the old "done from marker alone" path — a task with no PR is not done).
     if (pr) {
       await setStatus(task.id, "pr-open", pr.prUrl);
+      // SSE first (dashboard real-time), notifications-writer after (bell + Notion routing).
       emitActivity(task, "task.pr.opened", {
         external_id: task.externalId,
         pr_url: pr.prUrl,
@@ -142,12 +144,43 @@ async function processOne(task: Task): Promise<void> {
       // bullet distinct from the PR-opened one (operator may want to see
       // both — "PR opened" + "task closed by Plyne").
       emitActivity(task, "task.done", { external_id: task.externalId, pr_url: pr.prUrl });
+      // pr_opened — broadcast (owner_user_id null) so all admins see the PR
+      // in their bell. Per-PO routing can layer on top later via task owner.
+      void notify({
+        kind: "pr_opened",
+        severity: "info",
+        task_id: task.id,
+        task_name: task.title || task.externalId,
+        body: `PR opened for ${task.externalId}: ${pr.prUrl}`,
+        metadata: {
+          external_id: task.externalId,
+          pr_url: pr.prUrl,
+          branch: pr.branch,
+          commit_sha: pr.commitSha,
+          product: task.product,
+          repo: task.repo
+        }
+      });
     } else if (markers.status === "blocked") {
       await setStatus(task.id, "needs-operator");
       emitActivity(task, "task.escalated", {
         external_id: task.externalId,
         reason: "self_blocked",
         note: markers.note
+      });
+      void notify({
+        kind: "task_failed",
+        severity: "warn",
+        task_id: task.id,
+        task_name: task.title || task.externalId,
+        body: `Task ${task.externalId} self-blocked: ${markers.note || "no reason given"}`,
+        metadata: {
+          external_id: task.externalId,
+          marker: markers.status,
+          marker_note: markers.note,
+          pr_error: prError,
+          product: task.product
+        }
       });
     } else {
       await setStatus(task.id, "needs-operator");
@@ -156,6 +189,22 @@ async function processOne(task: Task): Promise<void> {
         pr_error: prError,
         exit_code: result.exitCode,
         marker: markers.status
+      });
+      void notify({
+        kind: "task_failed",
+        severity: prError ? "error" : "warn",
+        task_id: task.id,
+        task_name: task.title || task.externalId,
+        body: prError
+          ? `Task ${task.externalId} failed to open PR: ${prError}`
+          : `Task ${task.externalId} completed without a PR (no diff produced)`,
+        metadata: {
+          external_id: task.externalId,
+          marker: markers.status,
+          pr_error: prError,
+          exit_code: result.exitCode,
+          product: task.product
+        }
       });
     }
 
@@ -191,6 +240,18 @@ async function processOne(task: Task): Promise<void> {
     } catch {
       /* swallow — Notion outages must not crash the daemon */
     }
+    void notify({
+      kind: "task_failed",
+      severity: "error",
+      task_id: task.id,
+      task_name: task.title || task.externalId,
+      body: `Plyne v3 crashed processing ${task.externalId}: ${String(err).slice(0, 300)}`,
+      metadata: {
+        external_id: task.externalId,
+        product: task.product,
+        error: String(err).slice(0, 1500)
+      }
+    });
   } finally {
     inFlight.delete(task.id);
   }
@@ -214,6 +275,21 @@ async function cycle(): Promise<void> {
           { consecutiveAuthErrors },
           "runner: circuit breaker tripped — stopping runner. Rotate NOTION_TOKEN and `pm2 restart plyne-v3`."
         );
+        // task_escalated: broadcast to all admins. Use a synthetic task_id
+        // so dedupe collapses storm conditions to a single bell entry per
+        // 5-min window per the writer contract.
+        void notify({
+          kind: "task_escalated",
+          severity: "error",
+          task_id: "circuit_breaker:notion_auth",
+          task_name: "Notion auth circuit breaker",
+          body: `Plyne v3 runner stopped — ${consecutiveAuthErrors} consecutive Notion 401s. Rotate NOTION_TOKEN and \`pm2 restart plyne-v3\`.`,
+          metadata: {
+            consecutive_errors: consecutiveAuthErrors,
+            threshold: MAX_CONSECUTIVE_AUTH_ERRORS,
+            recovery: "rotate NOTION_TOKEN + pm2 restart plyne-v3"
+          }
+        });
         stopRunner();
       }
       return;
