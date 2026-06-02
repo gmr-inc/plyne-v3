@@ -9,6 +9,7 @@ import express from "express";
 import { loadEnv } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { handleMcpRequest } from "../mcp/server.js";
+import { handleSseStream } from "./activity-stream.js";
 
 const env = loadEnv();
 
@@ -24,6 +25,11 @@ export function startApi(): void {
   app.all("/mcp", (req, res, next) => {
     handleMcpRequest(req, res).catch(next);
   });
+
+  // SSE: live runner activity stream consumed by plyne-app Dashboard.
+  // Auth = `Authorization: Bearer ${PLYNE_DAEMON_API_TOKEN}` (enforced
+  // inside the handler so we can return 503 when the token isn't configured).
+  app.get("/activity/stream", handleSseStream);
 
   app.listen(env.API_PORT, () => {
     logger.info({ port: env.API_PORT }, "api: listening");
