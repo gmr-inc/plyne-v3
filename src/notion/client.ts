@@ -12,6 +12,7 @@ import { Client } from "@notionhq/client";
 import { z } from "zod";
 import { loadEnv } from "../config/env.js";
 import { logger } from "../config/logger.js";
+import { mirrorTaskStatus } from "../lib/supabase-reporter.js";
 
 const env = loadEnv();
 const notion = new Client({ auth: env.NOTION_TOKEN });
@@ -205,6 +206,13 @@ export async function setStatus(pageId: string, status: TaskStatus, prUrl?: stri
   };
   if (prUrl) properties["PR URL"] = { url: prUrl };
   await notion.pages.update({ page_id: pageId, properties });
+
+  // LIVE mirror to plyne-app Supabase so the FE reflects daemon progress in
+  // real time (pipeline/tabs/PR). Best-effort: no-ops when PLYNE_APP_SUPABASE_*
+  // is unset, and swallows all its own errors — must never break the Notion
+  // write or the runner. Awaited so the row lands promptly, but a slow/failed
+  // Supabase can't throw here (mirrorTaskStatus never rejects).
+  await mirrorTaskStatus(pageId, status, prUrl);
 }
 
 export async function addComment(pageId: string, text: string): Promise<void> {

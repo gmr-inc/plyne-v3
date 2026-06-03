@@ -81,10 +81,26 @@ async function main(): Promise<void> {
   }
 
   // ─── Step 6: runner + ingestion ────────────────────────────────────
-  const { startRunner, stopRunner } = await import("./orchestrator/runner.js");
+  const { startRunner, stopRunner, getInFlightCount } = await import("./orchestrator/runner.js");
   const { startIngestion, stopIngestion } = await import("./ingestion/index.js");
 
   startRunner();
+
+  // ─── plyne-app Supabase LIVE reporter (heartbeat) ──────────────────
+  // Gated on the PLYNE_APP_SUPABASE_* credentials being present. When unset
+  // the reporter no-ops (warn-once) and the daemon runs exactly as before —
+  // only the FE's live view of daemon progress is dark. The task-status
+  // mirror is wired separately inside notion/client.ts#setStatus.
+  const { startHeartbeat, stopHeartbeat } = await import("./lib/supabase-reporter.js");
+  if (env.PLYNE_APP_SUPABASE_URL && env.PLYNE_APP_SUPABASE_SERVICE_ROLE_KEY) {
+    startHeartbeat(getInFlightCount);
+    logger.info("plyne-app supabase reporter: heartbeat + task-status mirror active");
+  } else {
+    logger.warn(
+      "plyne-app supabase reporter: PLYNE_APP_SUPABASE_URL / PLYNE_APP_SUPABASE_SERVICE_ROLE_KEY " +
+        "unset — FE will not reflect live daemon progress. Set both on the VPS to activate."
+    );
+  }
 
   if (env.PLYNE_INGESTION_ENABLED) {
     startIngestion();
@@ -96,6 +112,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, "plyne-v3 shutting down");
     stopRunner();
     stopIngestion();
+    stopHeartbeat();
     setTimeout(() => process.exit(0), 1500);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
