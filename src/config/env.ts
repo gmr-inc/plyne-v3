@@ -82,6 +82,24 @@ const EnvSchema = z.object({
   // 5-hour session utilization (%) at/above which we stop dispatching tasks.
   PLYNE_V3_SESSION_PAUSE_PCT: z.coerce.number().default(95),
 
+  // ── Smart pacing (proactive weekly-budget protection) ────────────────────
+  // The hard caps above only brake when the allowance is nearly gone. Pacing
+  // instead spreads the week's budget: it pauses NEW task claims (ready tasks
+  // just wait — they're queued, not failed) whenever the current burn rate,
+  // extrapolated to the weekly reset, is projected to blow past 100%. SOFT and
+  // self-healing — auto-resumes as the week elapses and the rate becomes
+  // sustainable. The hard caps + reactive backstop always win over pacing.
+  PLYNE_V3_PACING_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true" || v === "1"),
+  // Don't trust the burn-rate projection until at least this fraction of the
+  // weekly window has elapsed (default 0.1 ≈ 17h) — early-week noise otherwise.
+  PLYNE_V3_PACING_MIN_ELAPSED_FRAC: z.coerce.number().default(0.1),
+  // Headroom (%) added to the 100% projection trip point. 0 → pause as soon as
+  // we're projected to exceed 100% before reset; raise it to allow some burst.
+  PLYNE_V3_PACING_MARGIN_PCT: z.coerce.number().default(0),
+
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
 
   // ── Monitoring ingestion (Sentry / BetterStack / Braintrust / Statuspage)

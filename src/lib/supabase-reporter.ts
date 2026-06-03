@@ -139,33 +139,96 @@ export function stopHeartbeat(): void {
   }
 }
 
+/** Optional reset timestamps to persist alongside a quota snapshot. */
+export interface QuotaResets {
+  /** seven_day.resets_at — ISO ts the weekly window resets at. */
+  weekResetsAt?: string | null;
+  /** five_hour.resets_at — ISO ts the 5h session window resets at. */
+  sessionResetsAt?: string | null;
+}
+
+/** Normalize an ISO reset ts → string | null (drops empty/unparseable values). */
+function normalizeResetTs(v: string | null | undefined): string | null {
+  if (typeof v !== "string" || v.length === 0) return null;
+  return Number.isFinite(Date.parse(v)) ? v : null;
+}
+
 /**
  * Insert one Claude Max quota snapshot so the FE "Plyne Max quota" card can show
  * real numbers (the table is otherwise empty). Best-effort — no-ops when the
  * shared client is null, swallows + logs every failure. Matches the FE contract:
- * `{ session_used_pct, week_used_pct, observed_at }`.
+ * `{ session_used_pct, week_used_pct, observed_at }`, plus `week_resets_at` /
+ * `session_resets_at` (timestamptz) when reset timestamps are supplied.
+ *
+ * The reset columns are added by a separate migration that may not have landed
+ * yet on the FE Supabase. If the insert errors because those columns don't
+ * exist, we RETRY once without them and log a warning — so the reporter keeps
+ * writing the core snapshot and never crashes the daemon ahead of the migration.
  */
-export async function writeQuotaSnapshot(sessionPct: number, weeklyPct: number): Promise<void> {
+export async function writeQuotaSnapshot(
+  sessionPct: number,
+  weeklyPct: number,
+  resets?: QuotaResets
+): Promise<void> {
   const client = getAppSupabase();
   if (!client) return;
   // Guard against a malformed reading slipping bad rows onto the dashboard.
   const session = Number.isFinite(sessionPct) ? Math.max(0, Math.min(100, sessionPct)) : 0;
   const week = Number.isFinite(weeklyPct) ? Math.max(0, Math.min(100, weeklyPct)) : 0;
+
+  const base: Record<string, unknown> = {
+    session_used_pct: session,
+    week_used_pct: week,
+    observed_at: new Date().toISOString()
+  };
+  const weekResetsAt = normalizeResetTs(resets?.weekResetsAt);
+  const sessionResetsAt = normalizeResetTs(resets?.sessionResetsAt);
+  const withResets: Record<string, unknown> = {
+    ...base,
+    week_resets_at: weekResetsAt,
+    session_resets_at: sessionResetsAt
+  };
+  const haveResets = weekResetsAt !== null || sessionResetsAt !== null;
+
   try {
-    const { error } = await client.from(QUOTA_TABLE).insert({
-      session_used_pct: session,
-      week_used_pct: week,
-      observed_at: new Date().toISOString()
-    });
+    const { error } = await client.from(QUOTA_TABLE).insert(haveResets ? withResets : base);
     if (error) {
+      // The reset columns may not exist yet (migration not landed). Detect the
+      // missing-column shape and retry once with the core row only, so we keep
+      // writing usable snapshots instead of crashing the reporter.
+      if (haveResets && isMissingColumnError(error)) {
+        logger.warn(
+          { err: error },
+          "reporter: quota snapshot reset columns missing (migration not landed?) — retrying without them"
+        );
+        const { error: retryErr } = await client.from(QUOTA_TABLE).insert(base);
+        if (retryErr) {
+          logger.warn({ err: retryErr, session, week }, "reporter: quota snapshot insert failed (fallback)");
+          return;
+        }
+        logger.debug({ session, week }, "reporter: quota snapshot written (without resets — fallback)");
+        return;
+      }
       logger.warn({ err: error, session, week }, "reporter: quota snapshot insert failed");
       return;
     }
-    logger.debug({ session, week }, "reporter: quota snapshot written");
+    logger.debug({ session, week, weekResetsAt, sessionResetsAt }, "reporter: quota snapshot written");
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     logger.warn({ err: message }, "reporter: quota snapshot threw");
   }
+}
+
+/** Heuristic: does a PostgREST/Postgres error indicate a missing/unknown column? */
+function isMissingColumnError(error: unknown): boolean {
+  const e = (error ?? {}) as { code?: unknown; message?: unknown };
+  // PostgREST surfaces unknown columns as PGRST204; Postgres uses 42703.
+  if (e.code === "PGRST204" || e.code === "42703") return true;
+  const msg = typeof e.message === "string" ? e.message.toLowerCase() : "";
+  return (
+    (msg.includes("column") && (msg.includes("does not exist") || msg.includes("could not find"))) ||
+    msg.includes("schema cache")
+  );
 }
 
 function safeInFlight(getInFlight: () => number): number {

@@ -63,6 +63,10 @@ export interface MaxUsage {
   session: UsageWindow;
   /** seven_day window (pct + resets_at). */
   weekly: UsageWindow;
+  /** seven_day.resets_at — ISO ts the weekly window resets at (null if absent). */
+  weekResetsAt: string | null;
+  /** five_hour.resets_at — ISO ts the 5h session window resets at (null if absent). */
+  sessionResetsAt: string | null;
   /** Wall-clock ms when this reading was taken. */
   fetchedAt: number;
 }
@@ -142,6 +146,8 @@ export function parseUsageResponse(body: unknown, fetchedAt = Date.now()): MaxUs
     weeklyPct: weekly.utilization,
     session,
     weekly,
+    weekResetsAt: weekly.resetsAt,
+    sessionResetsAt: session.resetsAt,
     fetchedAt
   };
 }

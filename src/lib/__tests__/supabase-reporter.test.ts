@@ -160,6 +160,60 @@ describe("supabase-reporter / writeQuotaSnapshot", () => {
     appTest.injectClient(client);
     await assert.doesNotReject(writeQuotaSnapshot(1, 2));
   });
+
+  it("includes week_resets_at + session_resets_at when supplied", async () => {
+    const { client, calls } = makeStubClient();
+    appTest.injectClient(client);
+    await writeQuotaSnapshot(29, 91, {
+      weekResetsAt: "2026-06-08T00:00:00Z",
+      sessionResetsAt: "2026-06-03T05:00:00Z"
+    });
+    assert.equal(calls.length, 1);
+    const payload = calls[0]!.payload as Record<string, unknown>;
+    assert.equal(payload["week_resets_at"], "2026-06-08T00:00:00Z");
+    assert.equal(payload["session_resets_at"], "2026-06-03T05:00:00Z");
+  });
+
+  it("omits reset columns entirely when no (valid) resets supplied", async () => {
+    const { client, calls } = makeStubClient();
+    appTest.injectClient(client);
+    await writeQuotaSnapshot(29, 91, { weekResetsAt: "not-a-date", sessionResetsAt: null });
+    const payload = calls[0]!.payload as Record<string, unknown>;
+    assert.ok(!("week_resets_at" in payload));
+    assert.ok(!("session_resets_at" in payload));
+  });
+
+  it("falls back to a reset-less insert when the columns don't exist (PGRST204)", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    let attempt = 0;
+    const client = {
+      from(_table: string) {
+        return {
+          async insert(payload: Record<string, unknown>) {
+            attempt += 1;
+            calls.push(payload);
+            // First attempt carries reset columns → simulate the migration gap.
+            if ("week_resets_at" in payload || "session_resets_at" in payload) {
+              return { error: { code: "PGRST204", message: "Could not find the 'week_resets_at' column" } };
+            }
+            return { error: null };
+          }
+        };
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
+    appTest.injectClient(client);
+    await assert.doesNotReject(
+      writeQuotaSnapshot(29, 91, { weekResetsAt: "2026-06-08T00:00:00Z", sessionResetsAt: null })
+    );
+    assert.equal(attempt, 2);
+    // Retry payload must NOT contain the reset columns.
+    const retry = calls[1]!;
+    assert.ok(!("week_resets_at" in retry));
+    assert.ok(!("session_resets_at" in retry));
+    assert.equal(retry["session_used_pct"], 29);
+    assert.equal(retry["week_used_pct"], 91);
+  });
 });
 
 describe("supabase-reporter / startHeartbeat", () => {
