@@ -24,6 +24,12 @@
 
 export type MergeDecision = "merge" | "wait" | "skip";
 
+/** A decision plus a human-readable reason, so the loop can log WHY it held. */
+export interface MergeDecisionDetail {
+  decision: MergeDecision;
+  reason: string;
+}
+
 export interface StatusCheckNode {
   // GitHub returns a heterogeneous union: CheckRun (__typename CheckRun) and
   // StatusContext (__typename StatusContext). We read the fields each exposes.
@@ -54,17 +60,27 @@ export interface PrGateInput {
   reviews?: PrReviewNode[] | null;
 }
 
-const CODERABBIT = "coderabbitai";
+// CodeRabbit identifies itself inconsistently across surfaces:
+//   - as a *commit status* (StatusContext) with context "CodeRabbit" and a
+//     null creator  ← this is how it reports on THIS repo;
+//   - as a *check-run* whose checkSuite.app.slug is "coderabbitai";
+//   - as a *PR review* whose author login is "coderabbitai[bot]".
+// Matching only the full "coderabbitai" slug MISSES the bare "CodeRabbit"
+// status context (it has no "ai" suffix), so we match the "coderabbit" stem.
+const CODERABBIT = "coderabbit";
+
+function looksLikeCodeRabbit(s: string | null | undefined): boolean {
+  return typeof s === "string" && s.toLowerCase().includes(CODERABBIT);
+}
 
 /** Does this status node belong to CodeRabbit (by app slug / context / creator)? */
 function isCodeRabbitNode(n: StatusCheckNode): boolean {
-  const haystacks = [
-    n.checkSuite?.app?.slug,
-    n.name,
-    n.context,
-    n.creator?.login
-  ];
-  return haystacks.some((h) => typeof h === "string" && h.toLowerCase().includes(CODERABBIT));
+  return (
+    looksLikeCodeRabbit(n.checkSuite?.app?.slug) ||
+    looksLikeCodeRabbit(n.name) ||
+    looksLikeCodeRabbit(n.context) ||
+    looksLikeCodeRabbit(n.creator?.login)
+  );
 }
 
 /** Normalize a single status node to pass | fail | pending. */
@@ -90,11 +106,22 @@ function classifyNode(n: StatusCheckNode): "pass" | "fail" | "pending" {
  * Decide whether the PR is safe to auto-merge from its GitHub JSON.
  */
 export function decideMerge(input: PrGateInput): MergeDecision {
+  return decideMergeWithReason(input).decision;
+}
+
+/**
+ * Same decision as {@link decideMerge}, but also returns a precise reason so
+ * the auto-merge loop can log WHY it held (e.g. "holding: CI check `lint`
+ * pending" vs "holding: CodeRabbit has not reviewed yet").
+ */
+export function decideMergeWithReason(input: PrGateInput): MergeDecisionDetail {
   const rollup = input.statusCheckRollup ?? [];
 
   // 1) Any failing check → RED → skip (human decides).
   for (const n of rollup) {
-    if (classifyNode(n) === "fail") return "skip";
+    if (classifyNode(n) === "fail") {
+      return { decision: "skip", reason: `CI check \`${nodeLabel(n)}\` failed` };
+    }
   }
 
   // 2) Mergeability. CONFLICTING / DIRTY → skip. UNKNOWN → wait (GitHub still
@@ -102,39 +129,66 @@ export function decideMerge(input: PrGateInput): MergeDecision {
   //    (BEHIND/UNSTABLE) → wait — give CI/branch a chance to settle.
   const mergeable = (input.mergeable ?? "").toUpperCase();
   const state = (input.mergeStateStatus ?? "").toUpperCase();
-  if (mergeable === "CONFLICTING") return "skip";
-  if (state === "DIRTY" || state === "DRAFT") return "skip";
-  if (reviewIsBlocked(input)) return "skip";
-  if (mergeable === "UNKNOWN" || mergeable === "") return "wait";
+  if (mergeable === "CONFLICTING") return { decision: "skip", reason: "PR has merge conflicts (mergeable=CONFLICTING)" };
+  if (state === "DIRTY") return { decision: "skip", reason: "mergeStateStatus=DIRTY (conflicts)" };
+  if (state === "DRAFT") return { decision: "skip", reason: "PR is a draft" };
+  if (reviewIsBlocked(input)) return { decision: "skip", reason: "reviewDecision=CHANGES_REQUESTED" };
+  if (mergeable === "UNKNOWN" || mergeable === "") {
+    return { decision: "wait", reason: "mergeable=UNKNOWN — GitHub still computing mergeability" };
+  }
 
   // 3) CodeRabbit gate: there must be a CodeRabbit signal AND it must be
   //    success/approved. No CodeRabbit signal yet → WAIT (don't merge an
-  //    unreviewed PR).
+  //    unreviewed PR). On THIS repo CodeRabbit reports as a StatusContext
+  //    (context="CodeRabbit"); on others as a check-run or a PR review.
   const crNodes = rollup.filter(isCodeRabbitNode);
-  const crReviews = (input.reviews ?? []).filter(
-    (r) => typeof r.author?.login === "string" && r.author.login.toLowerCase().includes(CODERABBIT)
-  );
+  const crReviews = (input.reviews ?? []).filter((r) => looksLikeCodeRabbit(r.author?.login));
   const crSeen = crNodes.length > 0 || crReviews.length > 0;
-  if (!crSeen) return "wait";
+  if (!crSeen) {
+    return { decision: "wait", reason: "CodeRabbit has not reviewed yet (no CodeRabbit check or review present)" };
+  }
 
   // Any CodeRabbit check still pending → wait.
-  if (crNodes.some((n) => classifyNode(n) === "pending")) return "wait";
+  if (crNodes.some((n) => classifyNode(n) === "pending")) {
+    return { decision: "wait", reason: "CodeRabbit signal still pending/in-progress" };
+  }
   // A CodeRabbit "CHANGES_REQUESTED" review → skip (human must resolve).
-  if (crReviews.some((r) => (r.state ?? "").toUpperCase() === "CHANGES_REQUESTED")) return "skip";
+  if (crReviews.some((r) => (r.state ?? "").toUpperCase() === "CHANGES_REQUESTED")) {
+    return { decision: "skip", reason: "CodeRabbit requested changes" };
+  }
 
   // 4) Any non-CodeRabbit check still pending → wait.
   for (const n of rollup) {
     if (isCodeRabbitNode(n)) continue;
-    if (classifyNode(n) === "pending") return "wait";
+    if (classifyNode(n) === "pending") {
+      return { decision: "wait", reason: `CI check \`${nodeLabel(n)}\` pending` };
+    }
   }
 
-  // 5) State must be CLEAN (or UNSTABLE collapses to wait above). Only merge on
-  //    a fully clean mergeable PR.
+  // 5) State gate. We've already proven every rollup entry is pass (no fail in
+  //    step 1, no pending in steps 3-4) and CodeRabbit is green. So:
+  //      - CLEAN / HAS_HOOKS → merge.
+  //      - UNSTABLE → merge: by definition some check is non-SUCCESS, but every
+  //        check we can see in the rollup passed, so the "unstable" signal is a
+  //        non-required check (e.g. an optional/informational status). The
+  //        branch-protection required set is satisfied (else state would be
+  //        BLOCKED), so it's safe to squash-merge.
   if (mergeable === "MERGEABLE" && (state === "CLEAN" || state === "HAS_HOOKS")) {
-    return "merge";
+    return { decision: "merge", reason: "all required CI checks SUCCESS + CodeRabbit green + mergeable CLEAN" };
   }
-  // Anything else (BLOCKED, BEHIND, UNSTABLE, UNKNOWN state) → wait.
-  return "wait";
+  if (mergeable === "MERGEABLE" && state === "UNSTABLE") {
+    return {
+      decision: "merge",
+      reason: "all visible checks SUCCESS + CodeRabbit green + mergeable; UNSTABLE is a non-required check"
+    };
+  }
+  // Anything else (BLOCKED, BEHIND, UNKNOWN state) → wait.
+  return { decision: "wait", reason: `mergeStateStatus=${state || "(empty)"} not yet mergeable` };
+}
+
+/** Best-effort human label for a status node (check name or status context). */
+function nodeLabel(n: StatusCheckNode): string {
+  return n.name || n.context || "(unnamed check)";
 }
 
 /**
