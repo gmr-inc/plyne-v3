@@ -20,6 +20,11 @@ import {
 } from "../notion/client.js";
 import { executeTask } from "../executor/claude-cli-executor.js";
 import { pushAndOpenPR, type PushPrResult } from "../executor/git-push-pr.js";
+import {
+  runAcceptanceCriteria,
+  renderAcResultsMarkdown,
+  type AcRunOutcome
+} from "../executor/ac-runner.js";
 import { getEventBus, type ActivityEventType } from "../lib/event-bus.js";
 import { notify } from "../lib/notifications-writer.js";
 
@@ -124,16 +129,51 @@ async function processOne(task: Task): Promise<void> {
 
     let pr: PushPrResult | null = null;
     let prError: string | null = null;
+    let acOutcome: AcRunOutcome | null = null;
+    let acBlocked = false;
 
     // Open a PR if (a) we have a real git worktree, (b) Claude did not
     // explicitly self-block. Done-marker is preferred but optional: if
     // Claude forgot the marker but produced a diff, we still want the PR.
     if (result.branch && markers.status !== "blocked") {
+      // ── AC GATE ──────────────────────────────────────────────────────
+      // Machine-verify the task's executable Acceptance Criteria in the SAME
+      // worktree/env Claude used, BEFORE opening the PR. This is what makes
+      // auto-merge safe: by pr-open the AC have already passed, so the merge
+      // gate only needs CI + CodeRabbit.
+      //
+      // Best-effort: an internal AC-runner error must never crash the daemon.
+      // On internal error we fall back to today's behaviour (open the PR) and
+      // log — the AC runner deliberately never throws, but we wrap anyway.
       try {
-        pr = await pushAndOpenPR(task, result.worktreeCwd, result.branch, result.childEnv);
+        acOutcome = runAcceptanceCriteria(
+          task.acceptanceCriteria,
+          result.worktreeCwd,
+          result.childEnv
+        );
       } catch (err) {
-        prError = String(err).slice(0, 400);
-        logger.error({ taskId: task.externalId, err }, "runner: pushAndOpenPR threw");
+        logger.error(
+          { taskId: task.externalId, err },
+          "runner: AC runner threw (falling back to open-PR-anyway)"
+        );
+        acOutcome = null;
+      }
+
+      if (acOutcome && acOutcome.status === "fail") {
+        // AC FAILED → do NOT open the PR / do NOT mark success. Escalate.
+        acBlocked = true;
+        logger.warn(
+          { taskId: task.externalId, failing: acOutcome.checks.filter((c) => !c.pass).length },
+          "runner: AC verification failed — withholding PR, escalating to operator"
+        );
+      } else {
+        const acBody = acOutcome ? renderAcResultsMarkdown(acOutcome) : undefined;
+        try {
+          pr = await pushAndOpenPR(task, result.worktreeCwd, result.branch, result.childEnv, acBody);
+        } catch (err) {
+          prError = String(err).slice(0, 400);
+          logger.error({ taskId: task.externalId, err }, "runner: pushAndOpenPR threw");
+        }
       }
     }
 
@@ -167,6 +207,48 @@ async function processOne(task: Task): Promise<void> {
           commit_sha: pr.commitSha,
           product: task.product,
           repo: task.repo
+        }
+      });
+    } else if (acBlocked && acOutcome) {
+      // AC verification failed: PR withheld, hand to a human.
+      await setStatus(task.id, "needs-operator");
+      const failing = acOutcome.checks.filter((c) => !c.pass);
+      const acFailMd = [
+        `**Plyne v3 withheld the PR — Acceptance Criteria failed.**`,
+        ``,
+        `The executable AC were run in the task worktree before opening a PR. ` +
+          `${failing.length} of ${acOutcome.checks.length} failed:`,
+        ``,
+        ...failing.map(
+          (c) =>
+            `- \`${c.command}\` → ${
+              c.spawnError ? `error: ${c.spawnError}` : `expected exit ${c.expectedExit}, got ${c.actualExit}`
+            }`
+        ),
+        ``,
+        `No PR was opened. Fix the AC (or the code) and re-run.`
+      ].join("\n");
+      try {
+        await addComment(task.id, acFailMd);
+      } catch (err) {
+        logger.warn({ taskId: task.externalId, err }, "runner: AC-fail comment failed");
+      }
+      emitActivity(task, "task.escalated", {
+        external_id: task.externalId,
+        reason: "ac_failed",
+        failing: failing.map((c) => c.command)
+      });
+      void notify({
+        kind: "task_failed",
+        severity: "warn",
+        task_id: task.id,
+        task_name: task.title || task.externalId,
+        body: `Task ${task.externalId} AC failed (${failing.length}/${acOutcome.checks.length}) — PR withheld`,
+        metadata: {
+          external_id: task.externalId,
+          reason: "ac_failed",
+          failing: failing.map((c) => `${c.command} (got ${c.actualExit}, want ${c.expectedExit})`),
+          product: task.product
         }
       });
     } else if (markers.status === "blocked") {
@@ -225,6 +307,9 @@ async function processOne(task: Task): Promise<void> {
       `- marker: \`${markers.status}\``,
       `- branch: \`${result.branch ?? "(scratch dir — no git)"}\``,
       pr ? `- PR: ${pr.prUrl} (\`${pr.commitSha.slice(0, 7)}\`)` : `- PR: _none_`,
+      acOutcome
+        ? `- AC: \`${acOutcome.status}\` (${acOutcome.checks.filter((c) => c.pass).length}/${acOutcome.checks.length} passed)`
+        : `- AC: _not run_`,
       markers.note ? `- note: ${markers.note}` : "",
       prError ? `- pr error: ${prError}` : "",
       ``,

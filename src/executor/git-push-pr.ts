@@ -45,7 +45,7 @@ function hasStagedOrUnstagedChanges(cwd: string): boolean {
   return (status.stdout?.toString().trim().length ?? 0) > 0;
 }
 
-function buildPrBody(task: Task): string {
+function buildPrBody(task: Task, bodySuffix?: string): string {
   return [
     `## Task`,
     `**${task.externalId}** — ${task.title}`,
@@ -58,9 +58,12 @@ function buildPrBody(task: Task): string {
     ``,
     `## Acceptance Criteria`,
     task.acceptanceCriteria || "_(none)_",
+    // AC results (machine-verified by Plyne v3 before the PR was opened) are
+    // appended here when the runner verified them — see ac-runner.ts.
+    ...(bodySuffix ? [``, bodySuffix] : []),
     ``,
     `---`,
-    `Opened by Plyne v3. Operator merges manually.`
+    `Opened by Plyne v3. AC pre-verified; merge gated on CI + CodeRabbit.`
   ].join("\n");
 }
 
@@ -72,7 +75,9 @@ export async function pushAndOpenPR(
   task: Task,
   cwd: string,
   branch: string,
-  childEnv: NodeJS.ProcessEnv
+  childEnv: NodeJS.ProcessEnv,
+  /** Optional Markdown appended to the PR body (e.g. the "## AC results" section). */
+  bodySuffix?: string
 ): Promise<PushPrResult | null> {
   if (!task.repo) {
     logger.warn({ taskId: task.externalId }, "git-push-pr: task has no repo, skipping");
@@ -123,7 +128,7 @@ export async function pushAndOpenPR(
   // is safer).
   const repoArg = `${GH_ORG}/${task.repo}`;
   const prTitle = `[${task.externalId}] ${task.title}`;
-  const prBody = buildPrBody(task);
+  const prBody = buildPrBody(task, bodySuffix);
   const ghPr = run(
     "gh",
     ["pr", "create", "-R", repoArg, "--head", branch, "--base", "main", "--title", prTitle, "--body", prBody],
