@@ -18,9 +18,9 @@
  * never crash because the notification sink is down. (Same posture as the
  * Notion comment path in runner.ts.)
  */
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { loadEnv } from "../config/env.js";
+import { type SupabaseClient } from "@supabase/supabase-js";
 import { logger } from "../config/logger.js";
+import { getAppSupabase } from "./supabase-app.js";
 
 export type NotificationKind = "task_escalated" | "pr_opened" | "task_failed" | "daemon_alert";
 export type NotificationSeverity = "info" | "warn" | "error";
@@ -80,29 +80,18 @@ class NotifyDedupe {
   }
 }
 
-let _client: SupabaseClient | null = null;
-let _disabled = false;
+// Allows tests to override the client without touching the shared singleton.
+let _clientOverride: SupabaseClient | null | undefined;
 const _dedupe = new NotifyDedupe();
 
+/**
+ * Resolve the Supabase client. Reuses the shared plyne-app client
+ * (src/lib/supabase-app.ts) so v3 keeps a single client across all sinks;
+ * tests may inject an override via __test.injectClient.
+ */
 function getClient(): SupabaseClient | null {
-  if (_disabled) return null;
-  if (_client) return _client;
-  const env = loadEnv();
-  const url = env.PLYNE_APP_SUPABASE_URL;
-  const key = env.PLYNE_APP_SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) {
-    if (!_disabled) {
-      logger.info(
-        "notify: PLYNE_APP_SUPABASE_URL / PLYNE_APP_SUPABASE_SERVICE_ROLE_KEY not set — notifications writer disabled"
-      );
-      _disabled = true;
-    }
-    return null;
-  }
-  _client = createClient(url, key, {
-    auth: { persistSession: false, autoRefreshToken: false }
-  });
-  return _client;
+  if (_clientOverride !== undefined) return _clientOverride;
+  return getAppSupabase();
 }
 
 export interface NotifyResult {
@@ -160,13 +149,11 @@ export async function notify(input: NotifyInput): Promise<NotifyResult> {
  */
 export const __test = {
   reset(): void {
-    _client = null;
-    _disabled = false;
+    _clientOverride = undefined;
     (_dedupe as unknown as { seen: Map<string, number> }).seen.clear();
   },
   injectClient(c: SupabaseClient | null): void {
-    _client = c;
-    _disabled = c === null;
+    _clientOverride = c;
   },
   dedupeSize(): number {
     return _dedupe.size();

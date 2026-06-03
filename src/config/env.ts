@@ -81,12 +81,17 @@ const EnvSchema = z.object({
 
   BRAINTRUST_API_KEY: z.string().optional(),
 
-  // ── Notifications writer (Supabase plyne-app data DB)
+  // ── plyne-app Supabase (data DB, project ref jwduoitebqncgaqrappk)
   //
-  // The v3 daemon writes "human attention required" events into the
-  // public.notifications table consumed by the plyne-app UI bell. Both keys
-  // are optional so v3 can boot in environments without the dashboard wired
-  // (greenfield VPS, dev/CI). When missing, `notify()` no-ops with a debug log.
+  // Single set of credentials shared by every v3 → plyne-app sink:
+  //   - notifications writer (public.notifications → UI bell)
+  //   - LIVE reporter (src/lib/supabase-reporter.ts): mirrors task status into
+  //     public.tasks by notion_page_id and upserts public.daemon_heartbeat, so
+  //     the FE reflects daemon progress in real time via Supabase realtime.
+  // Both keys are OPTIONAL so v3 can boot without the dashboard wired
+  // (greenfield VPS, dev/CI). When missing, every sink no-ops with a warn —
+  // the daemon must never crash or block on a missing/down Supabase.
+  //   URL = https://jwduoitebqncgaqrappk.supabase.co
   PLYNE_APP_SUPABASE_URL: z.string().optional(),
   PLYNE_APP_SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
 

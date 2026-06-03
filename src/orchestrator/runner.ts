@@ -57,6 +57,14 @@ function emitActivity(
 const inFlight = new Set<string>();
 
 /**
+ * Count of tasks currently claiming/executing. Read by the Supabase heartbeat
+ * reporter (src/lib/supabase-reporter.ts) so the dashboard shows live load.
+ */
+export function getInFlightCount(): number {
+  return inFlight.size;
+}
+
+/**
  * Circuit breaker: if the polling cycle gets a Notion 401 N times in a row
  * (token rotated mid-run, workspace scope dropped, etc.), stop the runner
  * loop entirely. Hardcoded threshold — we'd rather hold than spam 401s every
