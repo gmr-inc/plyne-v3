@@ -24,6 +24,7 @@ import { logger } from "../config/logger.js";
 
 const TASKS_TABLE = "tasks";
 const HEARTBEAT_TABLE = "daemon_heartbeat";
+const QUOTA_TABLE = "claude_quota_snapshots";
 const DAEMON_ID = "plyne-v3";
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
@@ -135,6 +136,35 @@ export function stopHeartbeat(): void {
   if (_heartbeatTimer) {
     clearInterval(_heartbeatTimer);
     _heartbeatTimer = undefined;
+  }
+}
+
+/**
+ * Insert one Claude Max quota snapshot so the FE "Plyne Max quota" card can show
+ * real numbers (the table is otherwise empty). Best-effort — no-ops when the
+ * shared client is null, swallows + logs every failure. Matches the FE contract:
+ * `{ session_used_pct, week_used_pct, observed_at }`.
+ */
+export async function writeQuotaSnapshot(sessionPct: number, weeklyPct: number): Promise<void> {
+  const client = getAppSupabase();
+  if (!client) return;
+  // Guard against a malformed reading slipping bad rows onto the dashboard.
+  const session = Number.isFinite(sessionPct) ? Math.max(0, Math.min(100, sessionPct)) : 0;
+  const week = Number.isFinite(weeklyPct) ? Math.max(0, Math.min(100, weeklyPct)) : 0;
+  try {
+    const { error } = await client.from(QUOTA_TABLE).insert({
+      session_used_pct: session,
+      week_used_pct: week,
+      observed_at: new Date().toISOString()
+    });
+    if (error) {
+      logger.warn({ err: error, session, week }, "reporter: quota snapshot insert failed");
+      return;
+    }
+    logger.debug({ session, week }, "reporter: quota snapshot written");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn({ err: message }, "reporter: quota snapshot threw");
   }
 }
 
