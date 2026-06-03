@@ -28,7 +28,7 @@ import {
   isNotionAuthError,
   type Task
 } from "../notion/client.js";
-import { decideMerge, type PrGateInput } from "../executor/merge-gate.js";
+import { decideMergeWithReason, type PrGateInput } from "../executor/merge-gate.js";
 import { getEventBus } from "../lib/event-bus.js";
 import { notify } from "../lib/notifications-writer.js";
 
@@ -122,13 +122,28 @@ async function processOnePrOpen(task: Task): Promise<void> {
   const gate = fetchPrGateInput(ownerRepo, parsed.number, childEnv);
   if (!gate) return; // transient — re-poll next cycle.
 
-  const decision = decideMerge(gate);
+  const { decision, reason } = decideMergeWithReason(gate);
   logger.info(
-    { taskId: task.externalId, ownerRepo, pr: parsed.number, decision, state: gate.mergeStateStatus },
-    "auto-merge: gate decision"
+    {
+      taskId: task.externalId,
+      ownerRepo,
+      pr: parsed.number,
+      decision,
+      reason,
+      mergeable: gate.mergeable,
+      state: gate.mergeStateStatus,
+      reviewDecision: gate.reviewDecision
+    },
+    `auto-merge: gate decision = ${decision} (${reason})`
   );
 
-  if (decision === "wait") return;
+  if (decision === "wait") {
+    logger.info(
+      { taskId: task.externalId, pr: parsed.number, reason },
+      `auto-merge: holding — ${reason}`
+    );
+    return;
+  }
 
   if (decision === "skip") {
     // A check is RED (or CodeRabbit requested changes / conflict). Leave it for
@@ -141,7 +156,7 @@ async function processOnePrOpen(task: Task): Promise<void> {
         [
           `**Plyne v3 auto-merge: held.**`,
           ``,
-          `PR ${task.prUrl} is not green (CI failed, CodeRabbit requested changes, or conflict). ` +
+          `PR ${task.prUrl} is not green: ${reason}. ` +
             `mergeable=\`${gate.mergeable}\` state=\`${gate.mergeStateStatus}\` reviewDecision=\`${gate.reviewDecision}\`.`,
           ``,
           `Left for operator review — Plyne did NOT merge.`

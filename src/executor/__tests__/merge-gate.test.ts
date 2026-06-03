@@ -102,10 +102,38 @@ describe("decideMerge", () => {
     assert.equal(decideMerge(green({ mergeable: "UNKNOWN" })), "wait");
   });
 
-  it("waits when state is BLOCKED/BEHIND/UNSTABLE even if checks pass", () => {
+  it("waits when state is BLOCKED/BEHIND even if checks pass", () => {
     assert.equal(decideMerge(green({ mergeStateStatus: "BLOCKED" })), "wait");
     assert.equal(decideMerge(green({ mergeStateStatus: "BEHIND" })), "wait");
-    assert.equal(decideMerge(green({ mergeStateStatus: "UNSTABLE" })), "wait");
+  });
+
+  it("merges UNSTABLE when every visible check passed (UNSTABLE = non-required check)", () => {
+    // mergeStateStatus=UNSTABLE means some non-required check isn't SUCCESS, but
+    // every check we can see in the rollup passed and CodeRabbit is green.
+    assert.equal(decideMerge(green({ mergeStateStatus: "UNSTABLE" })), "merge");
+  });
+
+  // --- Regression for the live #345 hang: CodeRabbit reports as a plain
+  //     StatusContext (context "CodeRabbit", null creator), NOT a check-run
+  //     with a "coderabbitai" app slug and NOT a PR review. The old
+  //     substring match on "coderabbitai" missed the bare "CodeRabbit" context
+  //     (no "ai"), so the gate waited forever on a fully green PR.
+  it("merges when CodeRabbit reports as a StatusContext context='CodeRabbit' (live #345 shape)", () => {
+    const input = green({
+      reviewDecision: "", // CodeRabbit auto-review does NOT set formal reviewDecision
+      reviews: [],
+      statusCheckRollup: [{ __typename: "StatusContext", context: "CodeRabbit", state: "SUCCESS" }]
+    });
+    assert.equal(decideMerge(input), "merge");
+  });
+
+  it("waits when the CodeRabbit StatusContext is still PENDING", () => {
+    const input = green({
+      reviewDecision: "",
+      reviews: [],
+      statusCheckRollup: [{ __typename: "StatusContext", context: "CodeRabbit", state: "PENDING" }]
+    });
+    assert.equal(decideMerge(input), "wait");
   });
 
   it("treats NEUTRAL/SKIPPED conclusions as pass", () => {
