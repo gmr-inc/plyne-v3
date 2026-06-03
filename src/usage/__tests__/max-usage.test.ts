@@ -36,6 +36,8 @@ describe("max-usage / parseUsageResponse", () => {
     assert.equal(u.weeklyPct, 91);
     assert.equal(u.session.resetsAt, "2026-06-03T18:00:00Z");
     assert.equal(u.weekly.resetsAt, "2026-06-09T00:00:00Z");
+    assert.equal(u.sessionResetsAt, "2026-06-03T18:00:00Z");
+    assert.equal(u.weekResetsAt, "2026-06-09T00:00:00Z");
     assert.equal(u.fetchedAt, 1000);
   });
 

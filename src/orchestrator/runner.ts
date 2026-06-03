@@ -42,7 +42,15 @@ const bus = getEventBus();
  */
 const pauseGate = new AutoPauseGate({
   weeklyPausePct: env.PLYNE_V3_WEEKLY_PAUSE_PCT,
-  sessionPausePct: env.PLYNE_V3_SESSION_PAUSE_PCT
+  sessionPausePct: env.PLYNE_V3_SESSION_PAUSE_PCT,
+  // Smart pacing: proactively queue task claims when the weekly burn rate is
+  // projected to exhaust the Max allowance before it resets. Soft/self-healing,
+  // and strictly subordinate to the hard caps above + the reactive backstop.
+  pacing: {
+    enabled: env.PLYNE_V3_PACING_ENABLED,
+    minElapsedFrac: env.PLYNE_V3_PACING_MIN_ELAPSED_FRAC,
+    marginPct: env.PLYNE_V3_PACING_MARGIN_PCT
+  }
 });
 
 /** Emit the operator bell when the gate enters a pause episode. Best-effort. */
@@ -72,7 +80,10 @@ async function pushQuotaSnapshot(): Promise<void> {
   try {
     const usage = await getMaxUsage({ force: true });
     if (!usage) return;
-    await writeQuotaSnapshot(usage.sessionPct, usage.weeklyPct);
+    await writeQuotaSnapshot(usage.sessionPct, usage.weeklyPct, {
+      weekResetsAt: usage.weekResetsAt,
+      sessionResetsAt: usage.sessionResetsAt
+    });
   } catch (err) {
     logger.warn({ err }, "runner: quota snapshot push failed (ignored)");
   }
