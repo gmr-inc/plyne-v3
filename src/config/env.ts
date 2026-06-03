@@ -53,6 +53,19 @@ const EnvSchema = z.object({
   // Boot mode: "daemon" (default — polling loop) or "smoke" (one-shot).
   PLYNE_MODE: z.enum(["daemon", "smoke"]).default("daemon"),
 
+  // ── Auto-merge (safe because the AC are machine-verified pre-PR) ───────
+  // When true (default), a second poller squash-merges `pr-open` PRs once they
+  // are fully green (all required CI checks SUCCESS + CodeRabbit success/
+  // approved + mergeable CLEAN), then marks the task `done`. Set false to keep
+  // the operator-manual-merge behaviour. The AC gate (Part 1) runs regardless.
+  PLYNE_V3_AUTO_MERGE: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true" || v === "1"),
+  // Cadence of the auto-merge poller. Slightly slower than the task poller —
+  // CI + CodeRabbit take time, no value hammering GitHub every few seconds.
+  PLYNE_V3_AUTO_MERGE_INTERVAL_MS: z.coerce.number().default(45000),
+
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
 
   // ── Monitoring ingestion (Sentry / BetterStack / Braintrust / Statuspage)

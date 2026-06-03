@@ -29,6 +29,18 @@ Notion status → posts a comment summarising the run.
 Operator reviews the PR Claude opened → merges manually (NEVER auto-merge).
 ```
 
+> **Addendum (2026-06 — safe auto-merge):** the above describes the original
+> manual gate. v3 now (a) machine-verifies a task's executable Acceptance
+> Criteria (`run: <cmd> expect_exit: <N>` lines) in the worktree BEFORE opening
+> the PR (`src/executor/ac-runner.ts`) — a failing AC withholds the PR and
+> escalates to `needs-operator`; and (b) runs an auto-merge poller
+> (`src/orchestrator/auto-merge-loop.ts`) that squash-merges a `pr-open` PR
+> only when fully green (required CI SUCCESS + CodeRabbit approved/success +
+> mergeable CLEAN), then sets the task `done`. Both paths are best-effort
+> (never crash the daemon) and the whole auto-merge half is gated behind
+> `PLYNE_V3_AUTO_MERGE` (default true). Because the AC are verified pre-PR, the
+> merge gate is CI + CodeRabbit only.
+
 ## Differences vs cto-v2
 
 | cto-v2 (v2) | plyne-v3 |

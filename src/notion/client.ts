@@ -189,6 +189,35 @@ export async function listReadyTasks(prefix: string, limit = 5): Promise<Task[]>
   return tasks;
 }
 
+/**
+ * List tasks in an arbitrary status filtered to the V3 prefix.
+ *
+ * Sibling of listReadyTasks (which is intentionally left untouched per the
+ * task contract). The auto-merge loop uses this to find `pr-open` tasks. Same
+ * FIFO ordering + prefix isolation so v3 never touches v2's PRs.
+ */
+export async function listTasksByStatus(
+  status: TaskStatus,
+  prefix: string,
+  limit = 25
+): Promise<Task[]> {
+  const res = await notion.databases.query({
+    database_id: env.NOTION_TASKS_DB_ID,
+    page_size: 50,
+    sorts: [{ timestamp: "created_time", direction: "ascending" }]
+  });
+  const tasks: Task[] = [];
+  for (const page of res.results) {
+    const t = mapPage(page);
+    if (!t) continue;
+    if (t.status !== status) continue;
+    if (prefix && !t.externalId.startsWith(prefix)) continue;
+    tasks.push(t);
+    if (tasks.length >= limit) break;
+  }
+  return tasks;
+}
+
 export async function getTask(pageId: string): Promise<Task | null> {
   try {
     const page = await notion.pages.retrieve({ page_id: pageId });

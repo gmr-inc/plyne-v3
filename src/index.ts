@@ -82,9 +82,16 @@ async function main(): Promise<void> {
 
   // ─── Step 6: runner + ingestion ────────────────────────────────────
   const { startRunner, stopRunner, getInFlightCount } = await import("./orchestrator/runner.js");
+  const { startAutoMerge, stopAutoMerge } = await import("./orchestrator/auto-merge-loop.js");
   const { startIngestion, stopIngestion } = await import("./ingestion/index.js");
 
   startRunner();
+
+  // Auto-merge loop: squash-merges pr-open PRs once fully green (CI +
+  // CodeRabbit). AC were already machine-verified before the PR opened
+  // (ac-runner), so this is the second half of safe auto-merge. Self-gates on
+  // PLYNE_V3_AUTO_MERGE (default true).
+  startAutoMerge();
 
   // ─── plyne-app Supabase LIVE reporter (heartbeat) ──────────────────
   // Gated on the PLYNE_APP_SUPABASE_* credentials being present. When unset
@@ -111,6 +118,7 @@ async function main(): Promise<void> {
   const shutdown = (signal: string) => {
     logger.info({ signal }, "plyne-v3 shutting down");
     stopRunner();
+    stopAutoMerge();
     stopIngestion();
     stopHeartbeat();
     setTimeout(() => process.exit(0), 1500);
