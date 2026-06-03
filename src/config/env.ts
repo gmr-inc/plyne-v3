@@ -66,6 +66,22 @@ const EnvSchema = z.object({
   // CI + CodeRabbit take time, no value hammering GitHub every few seconds.
   PLYNE_V3_AUTO_MERGE_INTERVAL_MS: z.coerce.number().default(45000),
 
+  // ── Claude Max usage reading + auto-pause ──────────────────────────────
+  // Plyne runs on a Claude Max OAuth session. If it burns its weekly Max
+  // allowance to a dead cap, every subsequent `claude` invocation fails and the
+  // daemon hammers a wall. These knobs let the runner read the live Max
+  // utilization and PAUSE dispatch before that happens.
+  //
+  // Token source: the running daemon's own `claude` invocations keep
+  // ~/.claude/.credentials.json fresh in-place. We READ claudeAiOauth.accessToken
+  // from there each cycle (overridable for tests / non-default homes). We never
+  // rotate the refresh token ourselves — that would desync the CLI's file.
+  CLAUDE_CREDENTIALS_PATH: z.string().optional(),
+  // Weekly Max utilization (%) at/above which we stop dispatching tasks.
+  PLYNE_V3_WEEKLY_PAUSE_PCT: z.coerce.number().default(90),
+  // 5-hour session utilization (%) at/above which we stop dispatching tasks.
+  PLYNE_V3_SESSION_PAUSE_PCT: z.coerce.number().default(95),
+
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
 
   // ── Monitoring ingestion (Sentry / BetterStack / Braintrust / Statuspage)

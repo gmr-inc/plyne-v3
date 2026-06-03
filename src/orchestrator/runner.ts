@@ -27,9 +27,59 @@ import {
 } from "../executor/ac-runner.js";
 import { getEventBus, type ActivityEventType } from "../lib/event-bus.js";
 import { notify } from "../lib/notifications-writer.js";
+import { writeQuotaSnapshot } from "../lib/supabase-reporter.js";
+import { getMaxUsage } from "../usage/max-usage.js";
+import { AutoPauseGate, isLimitHit } from "../usage/auto-pause.js";
 
 const env = loadEnv();
 const bus = getEventBus();
+
+/**
+ * Claude Max auto-pause gate. Read once per cycle BEFORE dispatch. Thresholds
+ * come from env (weekly default 90%, session default 95%). Best-effort: when
+ * the usage reader returns null the gate does NOT pause (it proceeds + warns),
+ * so a dark usage signal can never block the daemon.
+ */
+const pauseGate = new AutoPauseGate({
+  weeklyPausePct: env.PLYNE_V3_WEEKLY_PAUSE_PCT,
+  sessionPausePct: env.PLYNE_V3_SESSION_PAUSE_PCT
+});
+
+/** Emit the operator bell when the gate enters a pause episode. Best-effort. */
+function notifyPauseEntered(d: { window?: string; pct?: number; resumeAt: number; reason?: string }): void {
+  const pctTxt = d.pct !== undefined ? `${Math.round(d.pct)}%` : "cap";
+  void notify({
+    kind: "daemon_alert",
+    severity: "warn",
+    task_id: `auto_pause:${d.window ?? "limit"}`,
+    task_name: "Plyne Max auto-pause",
+    body: `Plyne in pausa — Max al ${pctTxt}. ${d.reason ?? ""} Riprende ~${new Date(d.resumeAt).toISOString()}.`.trim(),
+    metadata: {
+      window: d.window ?? "limit_hit",
+      pct: d.pct ?? null,
+      reason: d.reason ?? null,
+      resume_at: new Date(d.resumeAt).toISOString()
+    }
+  });
+}
+
+/**
+ * Push the latest Max usage to the plyne-app `claude_quota_snapshots` table so
+ * the FE quota card shows live numbers. Best-effort; bypasses the reader cache
+ * so the surfaced snapshot is fresh on its own cadence.
+ */
+async function pushQuotaSnapshot(): Promise<void> {
+  try {
+    const usage = await getMaxUsage({ force: true });
+    if (!usage) return;
+    await writeQuotaSnapshot(usage.sessionPct, usage.weeklyPct);
+  } catch (err) {
+    logger.warn({ err }, "runner: quota snapshot push failed (ignored)");
+  }
+}
+
+const QUOTA_SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+let _quotaTimer: NodeJS.Timeout | undefined;
 
 /**
  * Centralized SSE event emitter — keeps the shape consistent (task id,
@@ -114,6 +164,48 @@ async function processOne(task: Task): Promise<void> {
     emitActivity(task, "task.executor.started", { external_id: task.externalId });
 
     const result = await executeTask(task);
+
+    // ── Reactive backstop ────────────────────────────────────────────────
+    // If the claude CLI itself reported a usage/rate limit (its own strings),
+    // the proactive % gate lagged. Immediately arm the pause gate AND re-queue
+    // this task back to `ready` (NOT failed) so it retries after the window
+    // resets — one limit-hit stops the hammering instead of burning the task.
+    if (isLimitHit(result.stdout) || isLimitHit(result.stderr)) {
+      logger.warn(
+        { taskId: task.externalId },
+        "runner: claude reported a usage/rate limit — re-queuing task + arming auto-pause backstop"
+      );
+      // resets_at: prefer a fresh usage read so we resume at the real window
+      // reset; fall back to the gate's 30-min default when usage is unavailable.
+      let resetsAt: string | null = null;
+      try {
+        const u = await getMaxUsage();
+        resetsAt = (u?.weekly.resetsAt ?? u?.session.resetsAt) ?? null;
+      } catch {
+        /* best-effort */
+      }
+      pauseGate.forcePauseFromLimitHit(resetsAt, notifyPauseEntered);
+      try {
+        // Re-queue for retry after reset. Cleanup the worktree — the next
+        // attempt carves a fresh one.
+        await setStatus(task.id, "ready");
+        await addComment(
+          task.id,
+          "Plyne v3 hit a Claude usage/rate limit mid-execution. Task re-queued to `ready` and " +
+            "dispatch paused until the Max window resets — it will retry automatically."
+        );
+      } catch (err) {
+        logger.warn({ taskId: task.externalId, err }, "runner: re-queue after limit-hit failed");
+      }
+      emitActivity(task, "task.escalated", { external_id: task.externalId, reason: "usage_limit_hit" });
+      try {
+        result.worktreeDestroy();
+      } catch {
+        /* ignore */
+      }
+      return;
+    }
+
     const markers = inspectMarkers(result.worktreeCwd);
 
     // Before reporting, also strip the marker files so they don't get
@@ -352,6 +444,31 @@ async function processOne(task: Task): Promise<void> {
 
 async function cycle(): Promise<void> {
   if (inFlight.size >= env.MAX_CONCURRENT_TASKS) return;
+
+  // ── Claude Max auto-pause gate ───────────────────────────────────────────
+  // Read live Max utilization and decide whether to dispatch this cycle. If
+  // weekly% >= PLYNE_V3_WEEKLY_PAUSE_PCT or session% >= PLYNE_V3_SESSION_PAUSE_PCT
+  // we skip dispatch and set an internal pausedUntil = the window's resets_at,
+  // auto-resuming once the window resets and usage drops below the cap. The
+  // usage read + the gate are BEST-EFFORT — a null reading proceeds + warns,
+  // and nothing here throws into the daemon hot path.
+  const usage = await getMaxUsage();
+  if (!usage) {
+    logger.warn("runner: Max usage unavailable this cycle — proceeding without auto-pause gate");
+  }
+  const { dispatch } = pauseGate.evaluate(usage, notifyPauseEntered);
+  if (!dispatch) {
+    logger.warn(
+      {
+        weeklyPct: usage?.weeklyPct ?? null,
+        sessionPct: usage?.sessionPct ?? null,
+        resumeAt: pauseGate.pausedUntilMs() ? new Date(pauseGate.pausedUntilMs()!).toISOString() : null
+      },
+      "runner: dispatch paused (Max usage gate) — skipping task dispatch this cycle"
+    );
+    return;
+  }
+
   const slots = env.MAX_CONCURRENT_TASKS - inFlight.size;
   let tasks: Task[];
   try {
@@ -418,6 +535,14 @@ export function startRunner(): void {
     },
     "runner: starting daemon"
   );
+
+  // Surface Max usage on the dashboard quota card: push one snapshot now, then
+  // every ~5 min. Best-effort + self-gated (no-ops when usage read or the
+  // plyne-app Supabase client is unavailable). unref so it never holds the loop.
+  void pushQuotaSnapshot();
+  _quotaTimer = setInterval(() => void pushQuotaSnapshot(), QUOTA_SNAPSHOT_INTERVAL_MS);
+  _quotaTimer.unref?.();
+
   const tick = async () => {
     if (stopped) return;
     try {
@@ -434,4 +559,8 @@ export function startRunner(): void {
 export function stopRunner(): void {
   stopped = true;
   if (timer) clearTimeout(timer);
+  if (_quotaTimer) {
+    clearInterval(_quotaTimer);
+    _quotaTimer = undefined;
+  }
 }

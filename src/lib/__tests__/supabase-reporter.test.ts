@@ -12,12 +12,12 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mirrorTaskStatus, startHeartbeat, stopHeartbeat } from "../supabase-reporter.js";
+import { mirrorTaskStatus, startHeartbeat, stopHeartbeat, writeQuotaSnapshot } from "../supabase-reporter.js";
 import { __test as appTest } from "../supabase-app.js";
 
 interface Captured {
   table: string;
-  op: "update" | "upsert";
+  op: "update" | "upsert" | "insert";
   payload: unknown;
   eq?: { col: string; val: unknown };
   onConflict?: string;
@@ -50,6 +50,13 @@ function makeStubClient(opts: { updateError?: boolean; throwOn?: boolean; matche
           if (options?.onConflict !== undefined) cap.onConflict = options.onConflict;
           calls.push(cap);
           if (opts.throwOn) throw new Error("boom");
+          return { error: null };
+        },
+        async insert(payload: unknown) {
+          const cap: Captured = { table, op: "insert", payload };
+          calls.push(cap);
+          if (opts.throwOn) throw new Error("boom");
+          if (opts.updateError) return { error: { message: "rls denied" } };
           return { error: null };
         }
       };
@@ -107,6 +114,51 @@ describe("supabase-reporter / mirrorTaskStatus", () => {
     const { client } = makeStubClient({ matched: 0 });
     appTest.injectClient(client);
     await assert.doesNotReject(mirrorTaskStatus("page-missing", "claiming"));
+  });
+});
+
+describe("supabase-reporter / writeQuotaSnapshot", () => {
+  beforeEach(() => appTest.reset());
+  afterEach(() => appTest.reset());
+
+  it("no-ops when the shared client is null (env unset)", async () => {
+    appTest.injectClient(null);
+    await assert.doesNotReject(writeQuotaSnapshot(29, 91));
+  });
+
+  it("inserts session_used_pct + week_used_pct + observed_at into claude_quota_snapshots", async () => {
+    const { client, calls } = makeStubClient();
+    appTest.injectClient(client);
+    await writeQuotaSnapshot(29, 91);
+    assert.equal(calls.length, 1);
+    const c = calls[0]!;
+    assert.equal(c.table, "claude_quota_snapshots");
+    assert.equal(c.op, "insert");
+    const payload = c.payload as Record<string, unknown>;
+    assert.equal(payload["session_used_pct"], 29);
+    assert.equal(payload["week_used_pct"], 91);
+    assert.ok(typeof payload["observed_at"] === "string");
+  });
+
+  it("clamps out-of-range / non-finite percents", async () => {
+    const { client, calls } = makeStubClient();
+    appTest.injectClient(client);
+    await writeQuotaSnapshot(NaN, 150);
+    const payload = calls[0]!.payload as Record<string, unknown>;
+    assert.equal(payload["session_used_pct"], 0);
+    assert.equal(payload["week_used_pct"], 100);
+  });
+
+  it("swallows an insert error (no reject)", async () => {
+    const { client } = makeStubClient({ updateError: true });
+    appTest.injectClient(client);
+    await assert.doesNotReject(writeQuotaSnapshot(1, 2));
+  });
+
+  it("swallows a thrown error (no reject)", async () => {
+    const { client } = makeStubClient({ throwOn: true });
+    appTest.injectClient(client);
+    await assert.doesNotReject(writeQuotaSnapshot(1, 2));
   });
 });
 
