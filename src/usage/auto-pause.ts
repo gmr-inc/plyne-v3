@@ -109,8 +109,8 @@ export function decidePause(
  * Smart-pacing branch of decidePause. Returns a PauseDecision when pacing trips,
  * otherwise null (and logs the "ok" line so every cycle is diagnosable). Pure
  * given (usage, config, now). Pacing pauses are SOFT: the gate parks dispatch
- * until the weekly reset, but the burn rate falls as the week elapses so the
- * gate re-evaluates and resumes the moment the rate is sustainable again.
+ * only briefly (PACING_RECHECK_MS), then re-evaluates — and since the burn rate
+ * falls as the week elapses it resumes the moment the rate is sustainable again.
  */
 function decidePacing(usage: MaxUsage, cfg: PacingConfig | undefined, now: number): PauseDecision | null {
   if (!cfg || !cfg.enabled) return null;
