@@ -30,6 +30,8 @@ import { notify } from "../lib/notifications-writer.js";
 import { writeQuotaSnapshot } from "../lib/supabase-reporter.js";
 import { getMaxUsage } from "../usage/max-usage.js";
 import { AutoPauseGate, isLimitHit } from "../usage/auto-pause.js";
+import { captureException, captureMessage } from "../observability/sentry.js";
+import { logExecutorRun } from "../observability/braintrust.js";
 
 const env = loadEnv();
 const bus = getEventBus();
@@ -175,6 +177,32 @@ async function processOne(task: Task): Promise<void> {
     emitActivity(task, "task.executor.started", { external_id: task.externalId });
 
     const result = await executeTask(task);
+
+    // ── Braintrust baseline "Agent Health" logging ───────────────────────
+    // Log every Claude executor invocation (input / output / latency / exit
+    // code) so eval datasets can be built later. Best-effort + no-op when
+    // BRAINTRUST_API_KEY is unset; never throws into the runner. We log the raw
+    // run here; the post-execution disposition (PR / AC / blocked) is summarised
+    // in the outcome field once known below — logging now guarantees we capture
+    // the call even if downstream throws.
+    logExecutorRun(
+      {
+        taskId: task.id,
+        externalId: task.externalId,
+        product: task.product,
+        repo: task.repo,
+        effort: task.effort ?? undefined,
+        model: env.PLYNE_CLAUDE_MODEL
+      },
+      {
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        stackSummary: result.stackSummary,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        branch: result.branch
+      }
+    );
 
     // ── Reactive backstop ────────────────────────────────────────────────
     // If the claude CLI itself reported a usage/rate limit (its own strings),
@@ -425,6 +453,15 @@ async function processOne(task: Task): Promise<void> {
     if (pr) result.worktreeDestroy();
   } catch (err) {
     logger.error({ taskId: task.externalId, err }, "runner: processOne failed");
+    // Report per-task runner exceptions to Sentry with task context. These are
+    // the unexpected failures the daemon previously only logged locally.
+    captureException(err, {
+      phase: "runner_processOne",
+      taskId: task.id,
+      externalId: task.externalId,
+      product: task.product,
+      repo: task.repo
+    });
     emitActivity(task, "task.failed", {
       external_id: task.externalId,
       reason: "runner_exception",
@@ -496,6 +533,14 @@ async function cycle(): Promise<void> {
           { consecutiveAuthErrors },
           "runner: circuit breaker tripped — stopping runner. Rotate NOTION_TOKEN and `pm2 restart plyne-v3`."
         );
+        // SURFACE the runtime cousin of the crash-loop: a revoked token used to
+        // burn ~1900 cycles silently. The breaker now stops at 5 — report that
+        // trip to Sentry so on-call sees it without grepping pm2 logs.
+        captureMessage("plyne-v3 runner circuit breaker tripped (Notion auth)", "fatal", {
+          phase: "runner_circuit_breaker",
+          consecutiveAuthErrors,
+          recovery: "rotate NOTION_TOKEN + pm2 restart plyne-v3"
+        });
         // task_escalated: broadcast to all admins. Use a synthetic task_id
         // so dedupe collapses storm conditions to a single bell entry per
         // 5-min window per the writer contract.
@@ -560,6 +605,7 @@ export function startRunner(): void {
       await cycle();
     } catch (err) {
       logger.error({ err }, "runner: cycle threw");
+      captureException(err, { phase: "runner_cycle" });
     } finally {
       if (!stopped) timer = setTimeout(tick, env.POLL_INTERVAL_MS);
     }

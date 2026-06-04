@@ -178,6 +178,34 @@ const EnvSchema = z.object({
 
   BRAINTRUST_API_KEY: z.string().optional(),
 
+  // ── SELF-observability (the daemon watching ITSELF) ──────────────────────
+  //
+  // DISTINCT from the ingestion keys above. The SENTRY_AUTH_TOKEN /
+  // BETTERSTACK_* / BRAINTRUST_API_KEY block exists so Plyne can POLL OTHER
+  // products' monitoring and file bugs. The keys below let Plyne report ITS
+  // OWN crashes/logs/agent-calls — the gap that let it crash-loop ~1948 times
+  // unnoticed. All optional → each sink gracefully no-ops when unset and the
+  // daemon boots exactly as before (observability is purely additive).
+  //
+  // Sentry (errors / uncaught exceptions / FATAL boot path) — @sentry/node.
+  // This is the project DSN (ingest endpoint), NOT the management auth token.
+  // Create the `plyne-v3` Sentry project in org gmr-inc and paste its DSN here.
+  SENTRY_DSN: z.string().optional(),
+  // Traces sample rate for Sentry performance monitoring (0..1). Low by default
+  // — a polling daemon would otherwise generate a flood of identical spans.
+  SENTRY_TRACES_SAMPLE_RATE: z.coerce.number().default(0.1),
+  // Logical environment tag attached to every Sentry/OTel/Braintrust event.
+  PLYNE_OBSERVABILITY_ENV: z.string().default("production"),
+
+  // BetterStack structured-log shipping (OTLP/Logtail). The daemon's pino logs
+  // are mirrored to this BetterStack source. Both must be set to activate.
+  //   - BETTERSTACK_SOURCE_TOKEN  → the plyne-v3 source token
+  //   - BETTERSTACK_INGESTING_HOST→ e.g. s2491435.eu-nbg-2.betterstackdata.com
+  // BETTERSTACK_SOURCE_TOKEN is the self-observability source token (NOT the
+  // *_API_TOKEN used for ingestion polling).
+  BETTERSTACK_SOURCE_TOKEN: z.string().optional(),
+  BETTERSTACK_INGESTING_HOST: z.string().optional(),
+
   // ── plyne-app Supabase (data DB, project ref jwduoitebqncgaqrappk)
   //
   // Single set of credentials shared by every v3 → plyne-app sink:
@@ -210,7 +238,26 @@ export function loadEnv(): Env {
   if (!parsed.success) {
     // eslint-disable-next-line no-console
     console.error("[plyne-v3] env validation failed:", parsed.error.format());
-    process.exit(1);
+    // Surface the env-validation FATAL to Sentry when it's active (it usually
+    // is by this point — index.ts inits Sentry before any loadEnv() call).
+    // Best-effort + bounded: capture THEN flush+exit so the event isn't lost.
+    // No-ops to a plain exit(1) when Sentry is unconfigured or not yet init'd.
+    void (async () => {
+      try {
+        const { captureMessage, flushAndExit } = await import("../observability/sentry.js");
+        captureMessage("plyne-v3 FATAL env validation failed", "fatal", {
+          phase: "env_validation",
+          issues: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message }))
+        });
+        await flushAndExit(1);
+      } catch {
+        process.exit(1);
+      }
+    })();
+    // Fallback hard-exit if the async flush path somehow stalls.
+    setTimeout(() => process.exit(1), 2500);
+    // Unreachable — process exits above; throw keeps the type checker happy.
+    throw new Error("env validation failed");
   }
   cached = parsed.data;
   return cached;

@@ -16,7 +16,18 @@
  *   - src/config/vercel-env-pull.ts (Task A)
  *   - src/config/boot-validation.ts (Task B)
  *   - RESTART.md                    (Task C)
+ *   - src/observability/*           (self-monitoring: Sentry/BetterStack/Braintrust)
  */
+
+// Top-level import is safe: this module reads SENTRY_DSN LAZILY (inside
+// initSentry / capture*), so importing it before dotenv runs is fine. We need
+// the capture/flush helpers at module scope so the FATAL `.catch` below can
+// report the very crash-loop boot error that previously died silently.
+import {
+  captureException as sentryCaptureException,
+  flushAndExit as sentryFlushAndExit,
+  flush as sentryFlush
+} from "./observability/sentry.js";
 
 async function main(): Promise<void> {
   // ─── Step 1: hydrate process.env ───────────────────────────────────
@@ -26,6 +37,24 @@ async function main(): Promise<void> {
   const dotenv = await import("dotenv");
   dotenv.config();
 
+  // ─── Step 1b: SELF-OBSERVABILITY — init as early as possible ───────
+  // THE WHOLE POINT of this work: a boot failure (e.g. a rotated/expired
+  // credential that drives process.exit(1) and the pm2 crash-loop that burned
+  // ~1948 restarts unnoticed) must now SURFACE. We init Sentry + register the
+  // global uncaught/unhandled handlers BEFORE any of the boot validation or
+  // loops run, so even a failure inside this main() reaches Sentry. All three
+  // sinks GRACEFULLY no-op when their env is absent — the daemon boots
+  // identically with or without observability configured.
+  const { initSentry, installGlobalHandlers } = await import("./observability/sentry.js");
+  const { initBraintrust } = await import("./observability/braintrust.js");
+  const { startBetterstackTraces, betterstackEnabled } = await import("./observability/betterstack.js");
+  const sentryActive = initSentry();
+  installGlobalHandlers();
+  const braintrustActive = initBraintrust();
+  // OTel trace export is best-effort/lazy; logs already ship via the pino
+  // multistream wired in src/config/logger.ts.
+  void startBetterstackTraces();
+
   const { pullVercelEnv } = await import("./config/vercel-env-pull.js");
   const pullResult = await pullVercelEnv();
 
@@ -33,6 +62,15 @@ async function main(): Promise<void> {
   const { loadEnv } = await import("./config/env.js");
   const { logger } = await import("./config/logger.js");
   const env = loadEnv();
+
+  logger.info(
+    {
+      sentry: sentryActive,
+      braintrust: braintrustActive,
+      betterstack: betterstackEnabled()
+    },
+    "observability: self-monitoring sinks initialized"
+  );
 
   if (pullResult.ran) {
     logger.info(
@@ -115,12 +153,24 @@ async function main(): Promise<void> {
     logger.info("ingestion: disabled via PLYNE_INGESTION_ENABLED=false");
   }
 
+  const { flushBetterstackLogs, stopBetterstackTraces } = await import("./observability/betterstack.js");
+  const { flushBraintrust } = await import("./observability/braintrust.js");
+
   const shutdown = (signal: string) => {
     logger.info({ signal }, "plyne-v3 shutting down");
     stopRunner();
     stopAutoMerge();
     stopIngestion();
     stopHeartbeat();
+    // Flush observability sinks so the last logs/agent events aren't lost on a
+    // clean SIGTERM (pm2 restart). All best-effort + bounded; the exit timer
+    // fires regardless so shutdown can never hang on a dark sink.
+    void Promise.allSettled([
+      sentryFlush(),
+      flushBetterstackLogs(),
+      flushBraintrust(),
+      stopBetterstackTraces()
+    ]);
     setTimeout(() => process.exit(0), 1500);
   };
   process.on("SIGINT", () => shutdown("SIGINT"));
@@ -130,5 +180,10 @@ async function main(): Promise<void> {
 main().catch((err) => {
   // eslint-disable-next-line no-console
   console.error("plyne-v3 fatal boot error:", err);
-  process.exit(1);
+  // THE crash-loop path. Previously this died silently and pm2 restarted
+  // ~1948 times unnoticed. Now the FATAL boot error reaches Sentry, then we
+  // flush (bounded) before exiting so the event isn't dropped. flushAndExit
+  // no-ops gracefully when Sentry is unconfigured (still exits 1).
+  sentryCaptureException(err, { phase: "fatal_boot", path: "main().catch" });
+  void sentryFlushAndExit(1);
 });
