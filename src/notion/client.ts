@@ -228,6 +228,49 @@ export async function getTask(pageId: string): Promise<Task | null> {
   }
 }
 
+/**
+ * Promote an ingestion-created task: flip Status → `ready` AND rewrite the
+ * Name (external_id) to a runner-visible prefix so listReadyTasks() claims it.
+ * Both writes happen in a single Notion update so the task never sits in an
+ * inconsistent half-promoted state.
+ *
+ * Used exclusively by the auto-promote policy (src/ingestion/auto-promote.ts).
+ * The status mirror to plyne-app Supabase runs the same as setStatus().
+ */
+export async function promoteToReady(pageId: string, newExternalId: string): Promise<void> {
+  await notion.pages.update({
+    page_id: pageId,
+    properties: {
+      Status: { status: { name: "ready" } },
+      Name: { title: [{ type: "text", text: { content: newExternalId.slice(0, 60) } }] }
+    }
+  });
+  await mirrorTaskStatus(pageId, "ready");
+}
+
+/**
+ * Count tasks awaiting operator attention — used by the auto-promote circuit
+ * breaker so we don't pile autonomous work on a queue the human is already
+ * behind on. Counts `needs-operator` + `ready` across the given prefixes
+ * (empty = all). Best-effort caller handles the throw (fail-closed).
+ */
+export async function countOpenOperatorBacklog(prefixes: string[]): Promise<number> {
+  const res = await notion.databases.query({
+    database_id: env.NOTION_TASKS_DB_ID,
+    page_size: 100,
+    sorts: [{ timestamp: "created_time", direction: "descending" }]
+  });
+  let n = 0;
+  for (const page of res.results) {
+    const t = mapPage(page);
+    if (!t) continue;
+    if (t.status !== "needs-operator" && t.status !== "ready") continue;
+    if (prefixes.length > 0 && !prefixes.some((p) => t.externalId.startsWith(p))) continue;
+    n += 1;
+  }
+  return n;
+}
+
 export async function setStatus(pageId: string, status: TaskStatus, prUrl?: string): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const properties: Record<string, any> = {
