@@ -12,8 +12,11 @@
  *      every status change (the main fix). Live.
  *   2. startHeartbeat()    — every ~10s UPSERT `daemon_heartbeat` (drives the
  *      dashboard online/offline dot + in-flight count).
- *   3. Quota — investigated below; v3 has NO programmatic Max-plan quota
- *      signal, so we deliberately DO NOT write fake `claude_quota_snapshots`.
+ *   3. writeQuotaSnapshot() — inserts a `claude_quota_snapshots` row from the
+ *      live Max usage read (the ONLY live `/api/oauth/usage` caller, ~5-min
+ *      cadence with 429 backoff). This snapshot is both the FE quota card source
+ *      AND the data the auto-pause/pacing gate reads (src/usage/quota-snapshot.ts),
+ *      so the gate never has to hit the rate-limited endpoint itself.
  *
  * All writes go through the shared client in supabase-app.ts. When the
  * PLYNE_APP_SUPABASE_* env vars are absent the client is null and every

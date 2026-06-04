@@ -153,4 +153,63 @@ describe("max-usage / getMaxUsage", () => {
     assert.equal(calls, 1);
     assert.equal(a!.weeklyPct, b!.weeklyPct);
   });
+
+  it("on 429 keeps the last-good reading and arms an exponential backoff", async () => {
+    // 1st call: 200 → seeds last-good. 2nd: 429 → must return last-good + back off.
+    let calls = 0;
+    usageTest.injectFetch((async () => {
+      calls++;
+      if (calls === 1) return { ok: true, status: 200, async json() { return LIVE_SHAPE; } };
+      return { ok: false, status: 429, async json() { return {}; } };
+    }) as unknown as typeof fetch);
+
+    const good = await getMaxUsage({ force: true });
+    assert.equal(good!.weeklyPct, 91);
+    assert.equal(usageTest.peekBackoff().ms, 0);
+
+    const afterRateLimit = await getMaxUsage({ force: true });
+    // last-good retained — NOT null, NOT blanked.
+    assert.equal(afterRateLimit!.weeklyPct, 91);
+    assert.equal(afterRateLimit!.sessionPct, 29);
+    // backoff armed.
+    const b = usageTest.peekBackoff();
+    assert.ok(b.ms > 0, "backoff window should be armed after a 429");
+    assert.ok(b.until > Date.now(), "backoff-until should be in the future");
+  });
+
+  it("while backed off, does NOT hit the endpoint and returns last-good", async () => {
+    let calls = 0;
+    usageTest.injectFetch((async () => {
+      calls++;
+      if (calls === 1) return { ok: true, status: 200, async json() { return LIVE_SHAPE; } };
+      return { ok: false, status: 429, async json() { return {}; } };
+    }) as unknown as typeof fetch);
+
+    await getMaxUsage({ force: true }); // 200 → last-good
+    await getMaxUsage({ force: true }); // 429 → backoff armed
+    const callsBefore = calls;
+    // Even with force:true, backoff suppresses the live call.
+    const u = await getMaxUsage({ force: true });
+    assert.equal(calls, callsBefore, "must not hit the endpoint while backed off");
+    assert.equal(u!.weeklyPct, 91, "still serving last-good");
+  });
+
+  it("a real 200 clears the backoff so refresh isn't delayed", async () => {
+    usageTest.injectFetch((async () => ({ ok: false, status: 429, async json() { return {}; } })) as unknown as typeof fetch);
+    await getMaxUsage({ force: true }); // 429 → backoff
+    assert.ok(usageTest.peekBackoff().ms > 0);
+    // Manually clear backoff window to simulate it elapsing, then a 200 lands.
+    usageTest.reset();
+    usageTest.injectFetch((async () => ({ ok: true, status: 200, async json() { return LIVE_SHAPE; } })) as unknown as typeof fetch);
+    const u = await getMaxUsage({ force: true });
+    assert.equal(u!.weeklyPct, 91);
+    assert.equal(usageTest.peekBackoff().ms, 0, "backoff cleared on a real 200");
+  });
+
+  it("a 429 with no prior good reading returns null (nothing to retain) + backs off", async () => {
+    usageTest.injectFetch((async () => ({ ok: false, status: 429, async json() { return {}; } })) as unknown as typeof fetch);
+    const u = await getMaxUsage({ force: true });
+    assert.equal(u, null);
+    assert.ok(usageTest.peekBackoff().ms > 0);
+  });
 });
