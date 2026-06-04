@@ -116,6 +116,56 @@ const EnvSchema = z.object({
     .default("true")
     .transform((v) => v === "true" || v === "1"),
 
+  // ── Auto-promotion (backlog → ready) of ingestion-created tasks ───────────
+  //
+  // THE GAP this closes: ingestion files real bugs in Notion `backlog`, but the
+  // runner only picks `ready` tasks tagged with PLYNE_V3_TASK_PREFIX. Today an
+  // operator must manually promote. Auto-promote applies a strict policy
+  // (real source only, severity gate, dedupe, age gate, repo allowlist, rate
+  // limit, operator-backlog circuit breaker) and — ONLY when explicitly enabled
+  // — promotes a qualifying task toward execution.
+  //
+  // SAFETY POSTURE — default OFF / dry-run. When false (default), the policy
+  // still runs and LOGS what it WOULD promote, but writes nothing. This lets us
+  // observe the policy against live traffic before granting it write authority.
+  // The human flips PLYNE_AUTO_PROMOTE=true to go live. Never flip it on the
+  // same change that ships it.
+  PLYNE_AUTO_PROMOTE: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
+  // CRUCIAL SECOND GATE. Auto-promote may take an autonomously-DETECTED signal
+  // up to `ready` → runner → Claude → PR. It must NEVER let that PR auto-merge
+  // unless this SEPARATE flag is also true. Default OFF keeps a human in the
+  // loop for the merge of any autonomously-detected fix, even when the rest of
+  // the loop is live. (The auto-merge loop itself reads PLYNE_V3_AUTO_MERGE for
+  // operator-authored tasks; for auto-promoted tasks BOTH must be true.)
+  PLYNE_AUTO_PROMOTE_AUTOMERGE: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
+  // Max auto-promotions allowed per rolling window (rate limit). Prevents a
+  // signal storm (e.g. a deploy that lights up 40 Sentry issues) from spawning
+  // 40 concurrent Claude runs against real repos.
+  PLYNE_AUTO_PROMOTE_MAX_PER_WINDOW: z.coerce.number().default(3),
+  PLYNE_AUTO_PROMOTE_WINDOW_MS: z.coerce.number().default(60 * 60 * 1000),
+  // Minimum signal age before promotion (let a blip self-resolve; the poller
+  // already verifies-still-firing, this adds a soak margin). 0 disables.
+  PLYNE_AUTO_PROMOTE_MIN_AGE_MS: z.coerce.number().default(0),
+  // Circuit breaker: if the operator already has this many open tasks awaiting
+  // attention (needs-operator / ready backlog), STOP auto-promoting — don't
+  // pile autonomous work on top of a human who's already underwater. 0 disables.
+  PLYNE_AUTO_PROMOTE_MAX_OPEN_BACKLOG: z.coerce.number().default(10),
+  // Comma-separated allowlist of repos (org/name) auto-promote may target.
+  // EMPTY = allow nothing (fail-closed). The human opts each real repo in
+  // explicitly. The sandbox repo used for the e2e simulation goes here.
+  PLYNE_AUTO_PROMOTE_REPO_ALLOWLIST: z.string().default(""),
+  // The external_id prefix the runner picks up. Auto-promote rewrites a
+  // promoted task's Name to start with this so listReadyTasks() will claim it.
+  // Defaults to the same V3 test-flight prefix so promoted tasks are isolated
+  // from v2 and obvious in the Notion board.
+  PLYNE_AUTO_PROMOTE_PREFIX: z.string().default("V3-AUTO-"),
+
   SENTRY_AUTH_TOKEN: z.string().optional(),
   SENTRY_ORG: z.string().optional(),
   SENTRY_ORG_SLUG: z.string().optional(),

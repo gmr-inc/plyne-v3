@@ -7,19 +7,35 @@
  * Status (`backlog`), Source flag (`ingestion`), and have a deterministic
  * shape so they don't need the full contract checker.
  *
- * Tasks land in `backlog` (NOT `draft`) — the operator must explicitly
- * promote before Plyne picks them up. Memory `feedback_status_flow_draft_
- * _not_ready.md`: only the operator promotes backlog→draft.
+ * Tasks land in `backlog` (NOT `draft`). The operator promotes them — UNLESS
+ * the auto-promote policy (auto-promote.ts) is enabled AND the signal clears
+ * every guardrail, in which case the task is promoted to `ready` automatically
+ * right after creation. Auto-promote defaults OFF (dry-run/log-only), so the
+ * default behaviour is unchanged: tasks wait in `backlog` for a human.
  */
 import { Client } from "@notionhq/client";
 import { z } from "zod";
 import { loadEnv } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { lookupRepo } from "./portfolio-map.js";
+import { autoPromote, type PromoteDeps } from "./auto-promote.js";
+import { promoteToReady, countOpenOperatorBacklog } from "../notion/client.js";
 import type { IngestSignal } from "./types.js";
 
 const env = loadEnv();
 const notion = new Client({ auth: env.NOTION_TOKEN });
+
+/**
+ * Real Notion-bound dependencies for the auto-promote policy. Kept module-level
+ * so the policy stays pure + unit-testable (tests inject their own deps). The
+ * backlog count is scoped to the auto-promote + runner prefixes so the circuit
+ * breaker only counts autonomous/test-flight work, not unrelated v2 tasks.
+ */
+const AUTO_PROMOTE_DEPS: PromoteDeps = {
+  countOpenBacklog: () =>
+    countOpenOperatorBacklog([env.PLYNE_AUTO_PROMOTE_PREFIX, env.PLYNE_V3_TASK_PREFIX]),
+  promoteTask: (pageId, newExternalId) => promoteToReady(pageId, newExternalId)
+};
 
 const CreatedTask = z.object({
   pageId: z.string().min(1),
@@ -150,6 +166,24 @@ export async function createTaskFromSignal(signal: IngestSignal): Promise<Create
       { externalId, source: signal.source, product: signal.product, severity: signal.severity, url: parsed.data.url },
       "ingestion.task-creator: created Notion task"
     );
+
+    // ── Auto-promote (the detection→fix gap) ──────────────────────────────
+    // Consult the policy on every freshly-created task. Default OFF → this is a
+    // pure dry-run log; it only writes when the operator has flipped
+    // PLYNE_AUTO_PROMOTE=true AND every guardrail passes. Best-effort: a failure
+    // here leaves the task safely in `backlog` for the operator.
+    try {
+      await autoPromote(
+        { signal, pageId: parsed.data.pageId, externalId, repo },
+        AUTO_PROMOTE_DEPS
+      );
+    } catch (err) {
+      logger.warn(
+        { externalId, err: err instanceof Error ? err.message : String(err) },
+        "ingestion.task-creator: auto-promote threw (task stays in backlog)"
+      );
+    }
+
     return parsed.data;
   } catch (err) {
     logger.error(

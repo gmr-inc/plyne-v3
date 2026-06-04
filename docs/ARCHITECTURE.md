@@ -93,5 +93,35 @@ the operator-facing taxonomy collapses to "Claude is on it" vs "human attention"
 - Validate specs (Claude's planning sub-agent handles edge cases)
 - Run output-validation (Claude's code-reviewer sub-agent / CI does)
 - Merge PRs (operator manual gate)
-- Self-promote tasks (operator promotes backlog → ready)
+- Self-promote tasks (operator promotes backlog → ready) — **see addendum below: now optionally automated, default OFF**
 - Heal "stale" tasks (operator unsticks via the MCP `task.abort` tool)
+
+## Addendum (2026-06 — flagged auto-promotion of ingested bugs)
+
+The ingestion pollers file real detected bugs into Notion `backlog`. The runner
+only claims tasks that are BOTH `ready` AND prefixed with the runner prefix, so
+an `INGEST-…`/`backlog` task could never close the loop without an operator
+manually promoting + renaming it. `src/ingestion/auto-promote.ts` closes that
+detection→fix gap with a strict, layered policy:
+
+```
+created backlog task → evaluatePromotion(signal, ctx):
+   real source · not demo/synthetic · not a vendor outage · severity ≥ P1 ·
+   repo resolved AND in a FAIL-CLOSED allowlist · age ≥ soak · operator backlog
+   below breaker · rate-limit window has capacity
+→ (when PLYNE_AUTO_PROMOTE=true) promoteToReady(): Status backlog→ready +
+   rewrite Name to PLYNE_AUTO_PROMOTE_PREFIX so listReadyTasks() claims it
+```
+
+Safety contract:
+- `PLYNE_AUTO_PROMOTE` **default false** → dry-run: the policy runs and LOGS what
+  it WOULD promote, writes nothing. Default behaviour is unchanged.
+- An auto-promoted (autonomously-DETECTED) task may reach `pr-open`, but its PR
+  is **never** auto-merged unless `PLYNE_AUTO_PROMOTE_AUTOMERGE` is ALSO true
+  (separate gate, default false) — a human reviews the merge of any fix Plyne
+  both found and wrote.
+- Fail-closed repo allowlist (empty = promote nothing), rolling-window rate
+  limit, and an operator-backlog circuit breaker bound the blast radius.
+
+This is still NOT "autonomous CTO": the policy is mechanical (no decomposer /
+supervisor), and the human owns both switches.
