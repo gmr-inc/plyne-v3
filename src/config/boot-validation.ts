@@ -30,6 +30,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadEnv } from "./env.js";
 import { logger } from "./logger.js";
+import { captureMessage, flushAndExit } from "../observability/sentry.js";
 
 const FETCH_TIMEOUT_MS = 8_000;
 
@@ -221,7 +222,16 @@ export async function runBootValidation(): Promise<void> {
       // eslint-disable-next-line no-console
       console.error(`FATAL: ${f.key} boot check failed: ${f.detail ?? "no detail"}`);
     }
-    process.exit(1);
+    // SURFACE the crash-loop cause. A failed boot check (e.g. an expired
+    // GH_TOKEN, a malformed ANTHROPIC_API_KEY) is exactly what drove ~1948
+    // silent pm2 restarts. Report it to Sentry with the failing checks, then
+    // flush (bounded) before exiting so the event isn't dropped on exit(1).
+    // No-op + plain exit when Sentry is unconfigured.
+    captureMessage("plyne-v3 FATAL boot validation failed", "fatal", {
+      phase: "boot_validation",
+      failures: failures.map((f) => ({ key: f.key, detail: f.detail }))
+    });
+    await flushAndExit(1);
   }
 
   logger.info(

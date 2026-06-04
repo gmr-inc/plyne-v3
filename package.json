@@ -18,11 +18,20 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@notionhq/client": "^2.2.15",
+    "@sentry/node": "^10.51.0",
     "@supabase/supabase-js": "^2.106.2",
+    "braintrust": "^3.9.0",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "pino": "^10.3.1",
     "zod": "^4.1.5"
+  },
+  "optionalDependencies": {
+    "@opentelemetry/auto-instrumentations-node": "^0.74.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.216.0",
+    "@opentelemetry/resources": "^2.7.1",
+    "@opentelemetry/sdk-node": "^0.216.0",
+    "@opentelemetry/semantic-conventions": "^1.40.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
