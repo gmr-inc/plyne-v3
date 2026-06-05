@@ -16,7 +16,8 @@ import {
   setStatus,
   addComment,
   isNotionAuthError,
-  type Task
+  type Task,
+  type TaskStatus
 } from "../notion/client.js";
 import { executeTask } from "../executor/claude-cli-executor.js";
 import { pushAndOpenPR, type PushPrResult } from "../executor/git-push-pr.js";
@@ -25,6 +26,7 @@ import {
   renderAcResultsMarkdown,
   type AcRunOutcome
 } from "../executor/ac-runner.js";
+import { formatEscalationReason, type EscalationReason } from "./escalation-reason.js";
 import { getEventBus, type ActivityEventType } from "../lib/event-bus.js";
 import { notify } from "../lib/notifications-writer.js";
 import { writeQuotaSnapshot } from "../lib/supabase-reporter.js";
@@ -164,6 +166,26 @@ function inspectMarkers(cwd: string): { status: "done" | "blocked" | "unknown"; 
     logger.warn({ cwd, err }, "runner: marker inspection failed");
   }
   return { status: "unknown", note: "" };
+}
+
+/**
+ * One-line statement of what the agent set out to do — the task goal — for the
+ * human-oriented escalation reason. Prefer the task title (its Description),
+ * fall back to the external id.
+ */
+function taskGoalLine(task: Task): string {
+  return (task.title || task.externalId || "(untitled task)").slice(0, 200);
+}
+
+/**
+ * Persist a structured, human-oriented escalation reason onto the task while
+ * setting an escalation status. Wraps setStatus with the rendered reason so the
+ * console's LLM layer can explain (in plain language) WHY a human is needed.
+ * Status write is defensive (see notion.setStatus): a missing status option
+ * falls back to needs-rework/needs-operator while still writing the reason.
+ */
+async function escalate(task: Task, status: TaskStatus, reason: EscalationReason): Promise<void> {
+  await setStatus(task.id, status, { reason: formatEscalationReason(reason) });
 }
 
 async function processOne(task: Task): Promise<void> {
@@ -342,8 +364,23 @@ async function processOne(task: Task): Promise<void> {
       });
     } else if (acBlocked && acOutcome) {
       // AC verification failed: PR withheld, hand to a human.
-      await setStatus(task.id, "needs-operator");
       const failing = acOutcome.checks.filter((c) => !c.pass);
+      // Capture WHY onto the task (CTO Feedback) so the console can explain it.
+      // needs-revision = "the code Plyne wrote doesn't meet the AC, revise it"
+      // (defensively falls back to needs-rework/needs-operator if the board
+      // lacks that status option).
+      await escalate(task, "needs-revision", {
+        attempted: taskGoalLine(task),
+        outcome: "acceptance_criteria_failed",
+        totalChecks: acOutcome.checks.length,
+        failingChecks: failing.map((c) => ({
+          command: c.command,
+          expectedExit: c.expectedExit,
+          actualExit: c.actualExit,
+          spawnError: c.spawnError
+        })),
+        keyError: result.stderr ? result.stderr.slice(-200) : undefined
+      });
       const acFailMd = [
         `**Plyne v3 withheld the PR — Acceptance Criteria failed.**`,
         ``,
@@ -383,7 +420,14 @@ async function processOne(task: Task): Promise<void> {
         }
       });
     } else if (markers.status === "blocked") {
-      await setStatus(task.id, "needs-operator");
+      // Claude self-blocked (hard tech blocker it couldn't resolve). needs-rework
+      // = "Plyne hit a wall, a human needs to unblock" (defensive fallback to
+      // needs-operator if that option is absent).
+      await escalate(task, "needs-rework", {
+        attempted: taskGoalLine(task),
+        outcome: "self_blocked",
+        keyError: markers.note || (result.stderr ? result.stderr.slice(-200) : undefined)
+      });
       emitActivity(task, "task.escalated", {
         external_id: task.externalId,
         reason: "self_blocked",
@@ -404,7 +448,13 @@ async function processOne(task: Task): Promise<void> {
         }
       });
     } else {
-      await setStatus(task.id, "needs-operator");
+      // Either pushAndOpenPR threw (hard tech blocker on the git/PR step) or no
+      // diff was produced (no PR). Capture the distinction + the key error.
+      await escalate(task, "needs-operator", {
+        attempted: taskGoalLine(task),
+        outcome: prError ? "hard_tech_blocker" : "no_pr_produced",
+        keyError: prError || (result.stderr ? result.stderr.slice(-200) : undefined)
+      });
       emitActivity(task, "task.failed", {
         external_id: task.externalId,
         pr_error: prError,
@@ -468,7 +518,11 @@ async function processOne(task: Task): Promise<void> {
       error: String(err).slice(0, 300)
     });
     try {
-      await setStatus(task.id, "needs-operator");
+      await escalate(task, "needs-operator", {
+        attempted: taskGoalLine(task),
+        outcome: "runner_exception",
+        keyError: String(err).slice(0, 280)
+      });
       await addComment(task.id, `Plyne v3 crashed processing this task:\n\n\`\`\`\n${String(err).slice(0, 1500)}\n\`\`\``);
     } catch {
       /* swallow — Notion outages must not crash the daemon */
