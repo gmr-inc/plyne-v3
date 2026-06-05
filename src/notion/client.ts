@@ -18,6 +18,15 @@ const env = loadEnv();
 const notion = new Client({ auth: env.NOTION_TOKEN });
 
 /**
+ * Indirection over `notion.pages.update` so the defensive `setStatus` fallback
+ * can be unit-tested without a live Notion workspace. Production points at the
+ * real client; `__test.injectPagesUpdate` swaps in a stub.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type PagesUpdateFn = (args: any) => Promise<any>;
+let _pagesUpdate: PagesUpdateFn = (args) => notion.pages.update(args);
+
+/**
  * Live boot-time check: ping `users.me` to confirm the NOTION_TOKEN is not
  * just non-empty (already enforced by Zod) but actually valid.
  *
@@ -61,10 +70,52 @@ export const TaskStatus = z.enum([
   "pr-open",
   "done",
   "needs-operator",
+  "needs-rework",
+  "needs-revision",
   "abandoned",
   "cancelled"
 ]);
 export type TaskStatus = z.infer<typeof TaskStatus>;
+
+/**
+ * The Notion rich-text property where the runner writes the human-oriented
+ * escalation reason (so the console's LLM layer can explain WHY a human is
+ * needed). Kept as a constant so the defensive `setStatus` path can strip it
+ * by name if the board doesn't have the property yet.
+ */
+export const CTO_FEEDBACK_PROP = "CTO Feedback";
+
+/**
+ * Ordered fallback chain for escalation statuses. If a target `setStatus`
+ * option is MISSING on the Notion board (the 2026-06 `needs-operator`
+ * status-missing bug that stranded tasks), we walk this chain rather than
+ * throwing — a missing status must never again strand a task. The reason is
+ * still written regardless of which status finally sticks.
+ */
+const ESCALATION_FALLBACK: Record<string, TaskStatus[]> = {
+  "needs-revision": ["needs-revision", "needs-rework", "needs-operator"],
+  "needs-rework": ["needs-rework", "needs-operator"],
+  "needs-operator": ["needs-operator", "needs-rework"]
+};
+
+/**
+ * Detect a Notion "this status/select option does not exist on the board"
+ * error so the defensive setStatus can fall back to another status instead of
+ * throwing. Notion returns `validation_error` for an unknown option name.
+ */
+function isOptionMissingError(err: unknown): boolean {
+  const e = err as { code?: string; status?: number; message?: string };
+  if (e?.code === "validation_error" || e?.status === 400) return true;
+  const m = (e?.message ?? "").toLowerCase();
+  return m.includes("is not a valid") || m.includes("does not exist") || m.includes("not a property that exists");
+}
+
+/** True when the error blames a property (e.g. `CTO Feedback`) that the board lacks. */
+function isPropertyMissingError(err: unknown): boolean {
+  const e = err as { message?: string };
+  const m = (e?.message ?? "").toLowerCase();
+  return m.includes("is not a property that exists");
+}
 
 /**
  * Per-task Anthropic-stack config — read from task properties.
@@ -271,20 +322,119 @@ export async function countOpenOperatorBacklog(prefixes: string[]): Promise<numb
   return n;
 }
 
-export async function setStatus(pageId: string, status: TaskStatus, prUrl?: string): Promise<void> {
+/** Optional extras for a status write. `reason` is the human-oriented escalation
+ *  text persisted to the `CTO Feedback` rich-text property (overwritten, never
+ *  appended — idempotent across re-escalations). */
+export interface SetStatusOptions {
+  prUrl?: string | undefined;
+  reason?: string | undefined;
+}
+
+/** Build the Notion `properties` patch for a status write. */
+function buildStatusProperties(
+  status: TaskStatus,
+  opts: SetStatusOptions,
+  includeReason: boolean
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Record<string, any> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const properties: Record<string, any> = {
     Status: { status: { name: status } }
   };
-  if (prUrl) properties["PR URL"] = { url: prUrl };
-  await notion.pages.update({ page_id: pageId, properties });
+  if (opts.prUrl) properties["PR URL"] = { url: opts.prUrl };
+  if (includeReason && opts.reason) {
+    // Notion rich_text segments cap at 2000 chars; the reason is built compact
+    // (see escalation-reason.ts) but clamp defensively.
+    properties[CTO_FEEDBACK_PROP] = {
+      rich_text: [{ type: "text", text: { content: opts.reason.slice(0, 1900) } }]
+    };
+  }
+  return properties;
+}
+
+/**
+ * Update a task's Status (and optionally PR URL + the `CTO Feedback`
+ * escalation reason).
+ *
+ * Defensive contract (so a missing status/property never strands a task —
+ * the 2026-06 `needs-operator`-missing incident):
+ *   1. For escalation statuses we walk an ordered fallback chain
+ *      (needs-revision → needs-rework → needs-operator). If the primary status
+ *      OPTION is missing on the board, we retry with the next one instead of
+ *      throwing.
+ *   2. If the `CTO Feedback` PROPERTY itself is missing on the board, we retry
+ *      the SAME status WITHOUT that property (so the status still lands; the
+ *      reason is dropped only as a last resort, and logged).
+ *   3. The reason is written on EVERY attempt, so whichever status finally
+ *      sticks still carries the human-oriented explanation.
+ */
+export async function setStatus(
+  pageId: string,
+  status: TaskStatus,
+  prUrlOrOpts?: string | SetStatusOptions
+): Promise<void> {
+  const opts: SetStatusOptions =
+    typeof prUrlOrOpts === "string" ? { prUrl: prUrlOrOpts } : prUrlOrOpts ?? {};
+
+  const chain = ESCALATION_FALLBACK[status] ?? [status];
+  let lastErr: unknown = null;
+  let written: TaskStatus | null = null;
+  let reasonWritten = false;
+
+  for (const candidate of chain) {
+    // Try with the reason property first, then without if the property is missing.
+    for (const includeReason of opts.reason ? [true, false] : [false]) {
+      try {
+        await _pagesUpdate({
+          page_id: pageId,
+          properties: buildStatusProperties(candidate, opts, includeReason)
+        });
+        written = candidate;
+        reasonWritten = includeReason && Boolean(opts.reason);
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (includeReason && isPropertyMissingError(err)) {
+          // `CTO Feedback` property absent → retry same status without it.
+          logger.warn(
+            { pageId, status: candidate },
+            "notion.setStatus: CTO Feedback property missing — writing status without reason"
+          );
+          continue;
+        }
+        if (isOptionMissingError(err) && candidate !== chain[chain.length - 1]) {
+          // Status option absent on the board → fall through to next candidate.
+          logger.warn(
+            { pageId, missing: candidate },
+            "notion.setStatus: status option missing on board — falling back to next escalation status"
+          );
+          break;
+        }
+        // Not a missing-option/property error (auth, network, etc.) — bubble up.
+        throw err;
+      }
+    }
+    if (written) break;
+  }
+
+  if (!written) {
+    // Exhausted the chain on missing-option errors. Surface the last error.
+    throw lastErr ?? new Error(`notion.setStatus: could not set any status in chain for ${status}`);
+  }
+
+  if (status !== written) {
+    logger.warn({ pageId, requested: status, applied: written }, "notion.setStatus: applied fallback status");
+  }
+  if (opts.reason && !reasonWritten) {
+    logger.warn({ pageId, status: written }, "notion.setStatus: escalation reason NOT persisted (property missing)");
+  }
 
   // LIVE mirror to plyne-app Supabase so the FE reflects daemon progress in
   // real time (pipeline/tabs/PR). Best-effort: no-ops when PLYNE_APP_SUPABASE_*
   // is unset, and swallows all its own errors — must never break the Notion
   // write or the runner. Awaited so the row lands promptly, but a slow/failed
   // Supabase can't throw here (mirrorTaskStatus never rejects).
-  await mirrorTaskStatus(pageId, status, prUrl);
+  await mirrorTaskStatus(pageId, written, opts.prUrl);
 }
 
 export async function addComment(pageId: string, text: string): Promise<void> {
@@ -297,3 +447,17 @@ export async function addComment(pageId: string, text: string): Promise<void> {
     rich_text: chunks.map((c) => ({ type: "text" as const, text: { content: c } }))
   });
 }
+
+/**
+ * Test helper — swap the `notion.pages.update` implementation used by
+ * `setStatus` so the defensive fallback can be exercised without a live
+ * workspace. `reset()` restores the real client.
+ */
+export const __test = {
+  injectPagesUpdate(fn: PagesUpdateFn): void {
+    _pagesUpdate = fn;
+  },
+  reset(): void {
+    _pagesUpdate = (args) => notion.pages.update(args);
+  }
+};
