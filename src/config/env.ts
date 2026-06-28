@@ -82,6 +82,14 @@ const EnvSchema = z.object({
   // 5-hour session utilization (%) at/above which we stop dispatching tasks.
   PLYNE_V3_SESSION_PAUSE_PCT: z.coerce.number().default(95),
 
+  // Auto-pause/pacing read the latest `claude_quota_snapshots` row (written by
+  // the ~5-min live reporter) instead of hitting the rate-limited usage endpoint
+  // directly — so the gate never 429s and always has a value. If the latest
+  // snapshot is older than this many minutes we log a clear WARN but STILL apply
+  // the last-good caps (the weekly cap is slow-moving so last-good is trusted;
+  // the fast-moving session cap is flagged loudly). Never fail-open silently.
+  PLYNE_V3_QUOTA_SNAPSHOT_MAX_AGE_MIN: z.coerce.number().default(20),
+
   // ── Smart pacing (proactive weekly-budget protection) ────────────────────
   // The hard caps above only brake when the allowance is nearly gone. Pacing
   // instead spreads the week's budget: it pauses NEW task claims (ready tasks

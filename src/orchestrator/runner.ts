@@ -31,6 +31,7 @@ import { getEventBus, type ActivityEventType } from "../lib/event-bus.js";
 import { notify } from "../lib/notifications-writer.js";
 import { writeQuotaSnapshot } from "../lib/supabase-reporter.js";
 import { getMaxUsage } from "../usage/max-usage.js";
+import { getSnapshotUsage } from "../usage/quota-snapshot.js";
 import { AutoPauseGate, isLimitHit } from "../usage/auto-pause.js";
 import { captureException, captureMessage } from "../observability/sentry.js";
 import { logExecutorRun } from "../observability/braintrust.js";
@@ -77,8 +78,12 @@ function notifyPauseEntered(d: { window?: string; pct?: number; resumeAt: number
 
 /**
  * Push the latest Max usage to the plyne-app `claude_quota_snapshots` table so
- * the FE quota card shows live numbers. Best-effort; bypasses the reader cache
- * so the surfaced snapshot is fresh on its own cadence.
+ * the FE quota card shows live numbers AND the auto-pause/pacing gate has a
+ * value to read. This is the SINGLE live reader of `/api/oauth/usage`: it runs
+ * on the ~5-min QUOTA_SNAPSHOT_INTERVAL_MS cadence (well under the per-IP rate
+ * limit) and getMaxUsage() applies 429 backoff + last-good retention, so even
+ * under a closed rate-limit window this keeps writing the previous good value
+ * rather than 429-spamming or blanking the snapshot. Best-effort.
  */
 async function pushQuotaSnapshot(): Promise<void> {
   try {
@@ -236,11 +241,12 @@ async function processOne(task: Task): Promise<void> {
         { taskId: task.externalId },
         "runner: claude reported a usage/rate limit — re-queuing task + arming auto-pause backstop"
       );
-      // resets_at: prefer a fresh usage read so we resume at the real window
-      // reset; fall back to the gate's 30-min default when usage is unavailable.
+      // resets_at: read it from the latest snapshot (NOT the rate-limited usage
+      // endpoint) so we resume at the real window reset; fall back to the gate's
+      // 30-min default when no snapshot is available.
       let resetsAt: string | null = null;
       try {
-        const u = await getMaxUsage();
+        const u = await getSnapshotUsage();
         resetsAt = (u?.weekly.resetsAt ?? u?.session.resetsAt) ?? null;
       } catch {
         /* best-effort */
@@ -548,15 +554,20 @@ async function cycle(): Promise<void> {
   if (inFlight.size >= env.MAX_CONCURRENT_TASKS) return;
 
   // ── Claude Max auto-pause gate ───────────────────────────────────────────
-  // Read live Max utilization and decide whether to dispatch this cycle. If
+  // Read Max utilization from the latest `claude_quota_snapshots` row (written
+  // by the ~5-min live reporter) and decide whether to dispatch this cycle. We
+  // deliberately do NOT call the rate-limited `/api/oauth/usage` endpoint here —
+  // that read 429s under load and made the gate fail open. The snapshot path
+  // never hits the endpoint, so the gate always has a value. If
   // weekly% >= PLYNE_V3_WEEKLY_PAUSE_PCT or session% >= PLYNE_V3_SESSION_PAUSE_PCT
   // we skip dispatch and set an internal pausedUntil = the window's resets_at,
   // auto-resuming once the window resets and usage drops below the cap. The
-  // usage read + the gate are BEST-EFFORT — a null reading proceeds + warns,
-  // and nothing here throws into the daemon hot path.
-  const usage = await getMaxUsage();
+  // snapshot read + the gate are BEST-EFFORT — a null reading proceeds + warns
+  // (the reactive backstop is the last line), and nothing throws into the hot
+  // path. Staleness is surfaced as a loud WARN inside getSnapshotUsage.
+  const usage = await getSnapshotUsage();
   if (!usage) {
-    logger.warn("runner: Max usage unavailable this cycle — proceeding without auto-pause gate");
+    logger.warn("runner: Max usage snapshot unavailable this cycle — proceeding without auto-pause gate (reactive backstop still armed)");
   }
   const { dispatch } = pauseGate.evaluate(usage, notifyPauseEntered);
   if (!dispatch) {

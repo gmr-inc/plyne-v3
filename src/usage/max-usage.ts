@@ -34,6 +34,19 @@
  * Posture: BEST-EFFORT. Every failure path (missing file, parse error, 401,
  * network) returns `null` + a single warn and NEVER throws. A ~60s cache avoids
  * polling the endpoint on every task.
+ *
+ * SINGLE LIVE READER. As of the snapshot-decoupling fix, this module is the ONLY
+ * thing that hits the live `/api/oauth/usage` endpoint, and it is driven solely
+ * by the ~5-min Supabase quota reporter (src/orchestrator/runner.ts →
+ * writeQuotaSnapshot). Everything that makes auto-pause/pacing decisions reads
+ * the persisted snapshot row instead (src/usage/quota-snapshot.ts). One live
+ * call per ~5 min is far under the per-IP rate limit.
+ *
+ * 429 BACKOFF + LAST-GOOD. The endpoint is per-IP rate-limited. When it returns
+ * HTTP 429 we DO NOT clear the cache — we keep returning the previous good
+ * reading (last-good retention) and apply an exponential backoff so we don't
+ * keep poking a closed window. The backoff resets the moment a real 200 lands,
+ * so the snapshot refreshes as soon as the per-IP window clears.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -45,6 +58,13 @@ const OAUTH_BETA_HEADER = "oauth-2025-04-20";
 const DEFAULT_CREDENTIALS_PATH = "~/.claude/.credentials.json";
 const CACHE_TTL_MS = 60_000;
 const FETCH_TIMEOUT_MS = 10_000;
+
+// 429 backoff: when the per-IP rate limit trips, wait at least this long before
+// the next live attempt, doubling on each consecutive 429 up to the ceiling.
+// At the reporter's ~5-min cadence a single 429 is already absorbed by the next
+// tick; the backoff just guarantees we never tighten that cadence under load.
+const BACKOFF_BASE_MS = 60_000;
+const BACKOFF_MAX_MS = 30 * 60_000;
 
 /** One usage window (5h or 7d) parsed from the endpoint. */
 export interface UsageWindow {
@@ -154,16 +174,26 @@ export function parseUsageResponse(body: unknown, fetchedAt = Date.now()): MaxUs
 
 let _cache: MaxUsage | null = null;
 let _cacheAt = 0;
+// 429 backoff state: wall-clock ms before which we must not re-attempt the live
+// call, and the current backoff window (doubles per consecutive 429, resets on
+// a 200). While backed off we keep returning `_cache` (last-good).
+let _backoffUntil = 0;
+let _backoffMs = 0;
 
 /** Allow tests to swap in a fetch stub without hitting the network. */
 type FetchFn = typeof fetch;
 let _fetchOverride: FetchFn | undefined;
 
 /**
- * Read the live Max usage. Cached ~60s. Returns null on ANY error (missing
- * token, 401, network, non-200, parse) after logging a single warn — never
- * throws. `force: true` bypasses the cache (used by the dashboard pusher so the
- * surfaced snapshot is fresh on its own cadence).
+ * Read the live Max usage. Cached ~60s. Returns the last-good reading (or null)
+ * on ANY error (missing token, 401, network, non-200, parse) after logging a
+ * single warn — never throws. `force: true` bypasses the freshness cache (used
+ * by the quota reporter so the surfaced snapshot is fresh on its own cadence)
+ * but STILL honours the 429 backoff window, since that's about protecting the
+ * per-IP rate limit, not about cache freshness.
+ *
+ * This is the ONLY live caller of `/api/oauth/usage`. The auto-pause/pacing
+ * path reads the persisted snapshot instead (src/usage/quota-snapshot.ts).
  */
 export async function getMaxUsage(opts: { force?: boolean } = {}): Promise<MaxUsage | null> {
   const now = Date.now();
@@ -171,8 +201,19 @@ export async function getMaxUsage(opts: { force?: boolean } = {}): Promise<MaxUs
     return _cache;
   }
 
+  // 429 backoff: while the per-IP window is closed, don't re-attempt — return
+  // the previous good reading so the snapshot reporter keeps writing last-good
+  // instead of nulling the dashboard / spamming the endpoint.
+  if (now < _backoffUntil) {
+    logger.debug(
+      { backoffUntil: new Date(_backoffUntil).toISOString(), haveLastGood: _cache !== null },
+      "max-usage: in 429 backoff — returning last-good reading without hitting the endpoint"
+    );
+    return _cache;
+  }
+
   const token = readOAuthAccessToken();
-  if (!token) return null;
+  if (!token) return _cache;
 
   const fetchFn: FetchFn = _fetchOverride ?? fetch;
   const controller = new AbortController();
@@ -186,25 +227,40 @@ export async function getMaxUsage(opts: { force?: boolean } = {}): Promise<MaxUs
       },
       signal: controller.signal
     });
+    if (res.status === 429) {
+      // Per-IP rate limit. Do NOT clear the cache — keep last-good and back off
+      // exponentially so we eventually refresh once the window clears.
+      _backoffMs = _backoffMs === 0 ? BACKOFF_BASE_MS : Math.min(_backoffMs * 2, BACKOFF_MAX_MS);
+      _backoffUntil = Date.now() + _backoffMs;
+      logger.warn(
+        { backoffMs: _backoffMs, backoffUntil: new Date(_backoffUntil).toISOString(), haveLastGood: _cache !== null },
+        "max-usage: usage endpoint 429 (rate limited) — keeping last-good, backing off"
+      );
+      return _cache;
+    }
     if (!res.ok) {
       // 401 = token expired in-place (the CLI hasn't refreshed yet). Log and
       // skip; the next `claude` run refreshes the credentials file for us. We
-      // never attempt our own refresh-token rotation here.
-      logger.warn({ status: res.status }, "max-usage: usage endpoint returned non-200 — skipping this cycle");
-      return null;
+      // never attempt our own refresh-token rotation here. Keep last-good so a
+      // transient non-200 doesn't blank the snapshot.
+      logger.warn({ status: res.status }, "max-usage: usage endpoint returned non-200 — keeping last-good this cycle");
+      return _cache;
     }
     const json = (await res.json()) as unknown;
     const usage = parseUsageResponse(json, Date.now());
     _cache = usage;
     _cacheAt = usage.fetchedAt;
+    // A real 200 clears any backoff so the next refresh isn't delayed.
+    _backoffMs = 0;
+    _backoffUntil = 0;
     logger.debug(
       { sessionPct: usage.sessionPct, weeklyPct: usage.weeklyPct },
       "max-usage: read live Max utilization"
     );
     return usage;
   } catch (err) {
-    logger.warn({ err }, "max-usage: usage read failed (network/abort/parse) — proceeding without usage");
-    return null;
+    logger.warn({ err }, "max-usage: usage read failed (network/abort/parse) — keeping last-good");
+    return _cache;
   } finally {
     clearTimeout(timer);
   }
@@ -215,6 +271,8 @@ export const __test = {
   reset(): void {
     _cache = null;
     _cacheAt = 0;
+    _backoffUntil = 0;
+    _backoffMs = 0;
     _fetchOverride = undefined;
   },
   injectFetch(fn: FetchFn | undefined): void {
@@ -222,5 +280,8 @@ export const __test = {
   },
   peekCache(): MaxUsage | null {
     return _cache;
+  },
+  peekBackoff(): { until: number; ms: number } {
+    return { until: _backoffUntil, ms: _backoffMs };
   }
 };
