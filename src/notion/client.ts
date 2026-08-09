@@ -26,6 +26,69 @@ const notion = new Client({ auth: env.NOTION_TOKEN });
 type PagesUpdateFn = (args: any) => Promise<any>;
 let _pagesUpdate: PagesUpdateFn = (args) => notion.pages.update(args);
 
+// Read calls are safe to repeat. Notion occasionally answers with a gateway
+// 520, a client timeout, or a reset socket; treating the first transient as a
+// product bug creates three Sentry issues for the same short network wobble.
+// Keep writes single-shot: retrying a write after a lost response can duplicate
+// an action.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type DatabasesQueryFn = (args: any) => Promise<any>;
+let _databasesQuery: DatabasesQueryFn = (args) => notion.databases.query(args);
+let _retrySleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+const NOTION_READ_MAX_ATTEMPTS = 3;
+const NOTION_READ_RETRY_DELAYS_MS = [250, 750];
+const TRANSIENT_NOTION_HTTP_STATUSES = new Set([502, 503, 504, 520]);
+
+export function isTransientNotionReadError(err: unknown): boolean {
+  const e = err as { code?: string; status?: number; name?: string; message?: string };
+  if (typeof e?.status === "number" && TRANSIENT_NOTION_HTTP_STATUSES.has(e.status)) return true;
+  const code = String(e?.code ?? "").toUpperCase();
+  if (
+    [
+      "ECONNRESET",
+      "ETIMEDOUT",
+      "ECONNREFUSED",
+      "EAI_AGAIN",
+      "UND_ERR_CONNECT_TIMEOUT",
+      "NOTIONHQ_CLIENT_REQUEST_TIMEOUT"
+    ].includes(code)
+  ) {
+    return true;
+  }
+  if (e?.name === "RequestTimeoutError") return true;
+  const message = String(e?.message ?? "").toLowerCase();
+  return (
+    message.includes("econnreset") ||
+    message.includes("socket hang up") ||
+    message.includes("request timeout") ||
+    message.includes("timed out") ||
+    message.includes("fetch failed")
+  );
+}
+
+async function queryDatabaseWithTransientRetry(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  args: any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<any> {
+  for (let attempt = 1; attempt <= NOTION_READ_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await _databasesQuery(args);
+    } catch (err) {
+      if (!isTransientNotionReadError(err) || attempt === NOTION_READ_MAX_ATTEMPTS) {
+        throw err;
+      }
+      logger.warn(
+        { attempt, maxAttempts: NOTION_READ_MAX_ATTEMPTS, err },
+        "notion database read failed transiently — retrying"
+      );
+      await _retrySleep(NOTION_READ_RETRY_DELAYS_MS[attempt - 1] ?? 750);
+    }
+  }
+  throw new Error("unreachable notion read retry state");
+}
+
 /**
  * Live boot-time check: ping `users.me` to confirm the NOTION_TOKEN is not
  * just non-empty (already enforced by Zod) but actually valid.
@@ -223,7 +286,7 @@ function mapPage(page: any): Task | null {
  * Returns at most `limit` rows ordered by oldest-first (FIFO).
  */
 export async function listReadyTasks(prefix: string, limit = 5): Promise<Task[]> {
-  const res = await notion.databases.query({
+  const res = await queryDatabaseWithTransientRetry({
     database_id: env.NOTION_TASKS_DB_ID,
     page_size: 25,
     sorts: [{ timestamp: "created_time", direction: "ascending" }]
@@ -252,7 +315,7 @@ export async function listTasksByStatus(
   prefix: string,
   limit = 25
 ): Promise<Task[]> {
-  const res = await notion.databases.query({
+  const res = await queryDatabaseWithTransientRetry({
     database_id: env.NOTION_TASKS_DB_ID,
     page_size: 50,
     sorts: [{ timestamp: "created_time", direction: "ascending" }]
@@ -306,7 +369,7 @@ export async function promoteToReady(pageId: string, newExternalId: string): Pro
  * (empty = all). Best-effort caller handles the throw (fail-closed).
  */
 export async function countOpenOperatorBacklog(prefixes: string[]): Promise<number> {
-  const res = await notion.databases.query({
+  const res = await queryDatabaseWithTransientRetry({
     database_id: env.NOTION_TASKS_DB_ID,
     page_size: 100,
     sorts: [{ timestamp: "created_time", direction: "descending" }]
@@ -457,7 +520,15 @@ export const __test = {
   injectPagesUpdate(fn: PagesUpdateFn): void {
     _pagesUpdate = fn;
   },
+  injectDatabasesQuery(fn: DatabasesQueryFn): void {
+    _databasesQuery = fn;
+  },
+  injectRetrySleep(fn: (ms: number) => Promise<void>): void {
+    _retrySleep = fn;
+  },
   reset(): void {
     _pagesUpdate = (args) => notion.pages.update(args);
+    _databasesQuery = (args) => notion.databases.query(args);
+    _retrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   }
 };
