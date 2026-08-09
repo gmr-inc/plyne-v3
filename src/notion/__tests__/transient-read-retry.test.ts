@@ -76,8 +76,23 @@ describe("transient Notion database reads", () => {
     }
   });
 
+  it("does not retry permanent 5xx contracts such as 501 or 505", async () => {
+    withoutWaiting();
+    for (const status of [501, 505]) {
+      let calls = 0;
+      __test.injectDatabasesQuery(async () => {
+        calls += 1;
+        throw { status };
+      });
+      await assert.rejects(listReadyTasks("V3-"));
+      assert.equal(calls, 1);
+      assert.equal(isTransientNotionReadError({ status }), false);
+    }
+  });
+
   it("classifies the three production signatures, but not a 401", () => {
     assert.equal(isTransientNotionReadError({ status: 520 }), true);
+    assert.equal(isTransientNotionReadError({ status: 503 }), true);
     assert.equal(isTransientNotionReadError({ name: "RequestTimeoutError" }), true);
     assert.equal(isTransientNotionReadError({ code: "ECONNRESET" }), true);
     assert.equal(isTransientNotionReadError({ status: 401 }), false);

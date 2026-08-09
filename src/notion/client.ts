@@ -38,10 +38,11 @@ let _retrySleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 const NOTION_READ_MAX_ATTEMPTS = 3;
 const NOTION_READ_RETRY_DELAYS_MS = [250, 750];
+const TRANSIENT_NOTION_HTTP_STATUSES = new Set([502, 503, 504, 520]);
 
 export function isTransientNotionReadError(err: unknown): boolean {
   const e = err as { code?: string; status?: number; name?: string; message?: string };
-  if (typeof e?.status === "number" && e.status >= 500 && e.status <= 599) return true;
+  if (typeof e?.status === "number" && TRANSIENT_NOTION_HTTP_STATUSES.has(e.status)) return true;
   const code = String(e?.code ?? "").toUpperCase();
   if (
     [
